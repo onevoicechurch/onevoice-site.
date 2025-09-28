@@ -33,3 +33,7 @@ export default function Home() {
     </main>
   );
 }
+<div style={{ marginTop: 24 }}>
+  <a href="/operator" style={{ marginRight: 12 }}>Go to Operator Console →</a>
+  <a href="/s/DEMO">Try Listener (DEMO code) →</a>
+</div>
