@@ -1,5 +1,4 @@
 // app/layout.js
-import "./globals.css"; // optional, only if you want global styles
 
 export const metadata = {
   title: "OneVoice",
