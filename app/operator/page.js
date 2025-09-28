@@ -1,121 +1,170 @@
-"use client";
-import { useEffect, useRef, useState } from "react";
+'use client';
+import { useEffect, useMemo, useRef, useState } from 'react';
+
+const INPUT_LANGS = [
+  { code: "AUTO", label: "Auto-detect (Whisper)" },
+  { code: "en-US", label: "English (United States)" },
+  { code: "en-GB", label: "English (United Kingdom)" },
+  { code: "en-AU", label: "English (Australia)" },
+  { code: "en-CA", label: "English (Canada)" },
+  { code: "es-US", label: "Spanish (United States)" },
+  { code: "es-ES", label: "Spanish (Spain)" },
+  { code: "es-MX", label: "Spanish (Mexico)" },
+  { code: "vi-VN", label: "Vietnamese (Vietnam)" },
+  // add more if desired for UI; Whisper auto-detect covers most cases
+];
 
 export default function Operator() {
-  const [code, setCode] = useState("");
+  const [code, setCode] = useState(() => localStorage.getItem('ov:lastCode') || Math.random().toString(36).slice(2,6).toUpperCase());
+  const [inputLang, setInputLang] = useState(() => localStorage.getItem('ov:inputLang') || 'AUTO');
+  const [langsCsv, setLangsCsv] = useState(() => localStorage.getItem('ov:langs') || 'es,vi,zh');
   const [running, setRunning] = useState(false);
-  const [targetLang, setTargetLang] = useState("es");
   const [log, setLog] = useState([]);
   const mediaRef = useRef(null);
-  const recorderRef = useRef(null);
-  const chunksRef = useRef([]);
+  const recRef = useRef(null);
 
-  // Pull the live feed so the operator sees what listeners see
+  const siteOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://onevoice.church';
+  const listenerUrl = `${siteOrigin}/s/${encodeURIComponent(code)}`;
+  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(listenerUrl)}`;
+
+  useEffect(() => {
+    localStorage.setItem('ov:lastCode', code);
+    localStorage.setItem('ov:inputLang', inputLang);
+    localStorage.setItem('ov:langs', langsCsv);
+  }, [code, inputLang, langsCsv]);
+
+  // live preview of the stream (English + first target)
   useEffect(() => {
     if (!code) return;
     const es = new EventSource(`/api/stream?code=${code}`);
     es.onmessage = (e) => {
       const line = JSON.parse(e.data);
-      setLog((prev) => [...prev, line].slice(-100));
+      setLog((prev) => [...prev, line].slice(-150));
     };
     es.addEventListener("end", () => es.close());
     return () => es.close();
   }, [code]);
 
   async function startSession() {
-    const res = await fetch("/api/session", { method: "POST" });
-    const data = await res.json();
-    setCode(data.code);
+    const res = await fetch('/api/session', { method: 'POST' });
+    const j = await res.json();
+    if (j.code) setCode(j.code);
   }
 
   async function endSession() {
     if (!code) return;
-    await fetch(`/api/session?code=${code}`, { method: "DELETE" });
+    await fetch(`/api/session?code=${code}`, { method: 'DELETE' });
     stopMic();
-    setRunning(false);
-    setCode("");
     setLog([]);
   }
 
   async function startMic() {
-    if (!code) {
-      alert("Start a session first.");
-      return;
-    }
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true }, video: false });
     mediaRef.current = stream;
 
-    const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
-    recorderRef.current = recorder;
+    const rec = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+    recRef.current = rec;
 
-    recorder.ondataavailable = async (e) => {
-      if (!e.data || e.data.size < 2000) return; // ignore tiny slivers
+    rec.ondataavailable = async (e) => {
+      if (!e.data || e.data.size < 1500) return;
       try {
-        const blob = e.data;
-        const buf = await blob.arrayBuffer();
-        await fetch(`/api/ingest?code=${code}&lang=${targetLang}`, {
-          method: "POST",
-          headers: { "Content-Type": blob.type || "audio/webm" },
-          body: buf,
+        const qs = new URLSearchParams({
+          code,
+          inputLang,
+          langs: (langsCsv || 'es').replace(/\s+/g, '')
+        });
+        const ab = await e.data.arrayBuffer();
+        await fetch('/api/ingest?' + qs.toString(), {
+          method: 'POST',
+          headers: { 'Content-Type': e.data.type || 'audio/webm' },
+          body: ab
         });
       } catch (err) {
-        console.error("upload error", err);
+        console.error('ingest error', err);
       }
     };
 
-    // push 1 chunk per second
-    recorder.start(1000);
+    // send ~1s chunks
+    rec.start(1000);
     setRunning(true);
   }
 
   function stopMic() {
-    recorderRef.current?.stop();
+    try { recRef.current?.stop(); } catch {}
     mediaRef.current?.getTracks().forEach(t => t.stop());
     setRunning(false);
   }
 
   return (
-    <div style={{ maxWidth: 800, margin: "40px auto" }}>
-      <h1>🎚️ Operator Console</h1>
+    <main style={{ minHeight: '100vh', padding: 24, color: 'white', background: 'linear-gradient(135deg,#0e1a2b,#153a74 60%,#0f3070)' }}>
+      <div style={{ maxWidth: 960, margin: '0 auto' }}>
+        <h1>🎚️ Operator Console (Whisper)</h1>
+        <p style={{ opacity: 0.9 }}>Share the code/QR. Set input language (or Auto). Choose target languages (csv). Start the mic.</p>
 
-      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-        <button onClick={startSession} disabled={!!code}>Start Session</button>
-        <button onClick={endSession} disabled={!code}>End Session</button>
-
-        <label>
-          Target language{" "}
-          <select value={targetLang} onChange={(e) => setTargetLang(e.target.value)}>
-            <option value="es">Spanish</option>
-            <option value="pt">Portuguese</option>
-            <option value="fr">French</option>
-            <option value="de">German</option>
-            <option value="zh">Chinese</option>
-            <option value="ar">Arabic</option>
-            <option value="vi">Vietnamese</option>
-          </select>
-        </label>
-
-        <button onClick={startMic} disabled={!code || running}>🎙️ Mic ON</button>
-        <button onClick={stopMic} disabled={!running}>⏹️ Mic OFF</button>
-      </div>
-
-      <div style={{ marginTop: 16 }}>
-        <strong>Access Code:</strong>{" "}
-        <span style={{ fontSize: 24 }}>{code || "—"}</span>
-      </div>
-
-      <hr style={{ margin: "24px 0" }} />
-
-      <h3>Live Feed</h3>
-      <div style={{ background: "#111", color: "#fff", padding: 12, borderRadius: 8, minHeight: 160 }}>
-        {log.map((l) => (
-          <div key={l.ts} style={{ marginBottom: 8 }}>
-            <div style={{ opacity: 0.6, fontSize: 12 }}>{new Date(l.ts).toLocaleTimeString()}</div>
-            <div>🗣️ {l.text}</div>
-            <div>🌍 {l.translated}</div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 16, alignItems: 'center' }}>
+          <div>
+            <div style={{ marginBottom: 6 }}>Access Code</div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <code style={{ background: 'rgba(255,255,255,0.15)', padding: '6px 10px', borderRadius: 8, fontSize: 20 }}>{code}</code>
+              <button onClick={startSession} style={{ padding: '8px 12px', border: 'none', borderRadius: 8, fontWeight: 700, cursor: 'pointer' }}>New Session</button>
+              <a href={listenerUrl} target="_blank" rel="noreferrer" style={{ color: 'white', textDecoration: 'underline' }}>Open Listener</a>
+            </div>
           </div>
-        ))}
+          <div style={{ justifySelf: 'end' }}>
+            <img src={qrUrl} alt="QR" width={120} height={120} style={{ background: 'white', borderRadius: 8 }} />
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', gap: 12, marginTop: 16, flexWrap: 'wrap' }}>
+          <label>
+            <span style={{ marginRight: 8 }}>Input language:</span>
+            <select value={inputLang} onChange={(e) => setInputLang(e.target.value)} style={{ padding: 8, borderRadius: 8 }}>
+              {INPUT_LANGS.map((l) => (
+                <option key={l.code} value={l.code} disabled={l.disabled}>{l.label}</option>
+              ))}
+            </select>
+          </label>
+
+          <label>
+            <span style={{ marginRight: 8 }}>Offer languages (csv):</span>
+            <input
+              value={langsCsv}
+              onChange={(e) => setLangsCsv(e.target.value)}
+              placeholder="es,vi,zh"
+              style={{ padding: 8, borderRadius: 8, width: 240 }}
+            />
+          </label>
+
+          {!running ? (
+            <button onClick={startMic} style={{ padding: '8px 12px', borderRadius: 8, border: 'none', fontWeight: 700, cursor: 'pointer' }}>
+              🎙️ Mic ON
+            </button>
+          ) : (
+            <button onClick={stopMic} style={{ padding: '8px 12px', borderRadius: 8, border: 'none', background: '#ff5555', color: 'white', fontWeight: 700, cursor: 'pointer' }}>
+              ⏹️ Mic OFF
+            </button>
+          )}
+
+          <button onClick={endSession} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.5)', cursor: 'pointer' }}>
+            End Session
+          </button>
+        </div>
+
+        <h3 style={{ marginTop: 18 }}>Live Preview</h3>
+        <div style={{ background: '#0b1220', color: 'white', padding: 12, borderRadius: 8, minHeight: 160, lineHeight: 1.6 }}>
+          {log.map((l) => {
+            // pick first offered language to preview
+            const first = (langsCsv || 'es').split(',')[0].trim();
+            return (
+              <div key={l.ts} style={{ marginBottom: 8 }}>
+                <div style={{ opacity: 0.6, fontSize: 12 }}>{new Date(l.ts).toLocaleTimeString()}</div>
+                <div>🗣️ {l.en}</div>
+                <div>🌍 {l.tx?.[first]}</div>
+              </div>
+            );
+          })}
+        </div>
       </div>
-    </div>
+    </main>
   );
 }
