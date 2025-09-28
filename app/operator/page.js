@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 const INPUT_LANGS = [
   { code: "AUTO", label: "Auto-detect (Whisper)" },
@@ -11,29 +11,42 @@ const INPUT_LANGS = [
   { code: "es-ES", label: "Spanish (Spain)" },
   { code: "es-MX", label: "Spanish (Mexico)" },
   { code: "vi-VN", label: "Vietnamese (Vietnam)" },
-  // add more if desired for UI; Whisper auto-detect covers most cases
 ];
 
 export default function Operator() {
-  const [code, setCode] = useState(() => localStorage.getItem('ov:lastCode') || Math.random().toString(36).slice(2,6).toUpperCase());
-  const [inputLang, setInputLang] = useState(() => localStorage.getItem('ov:inputLang') || 'AUTO');
-  const [langsCsv, setLangsCsv] = useState(() => localStorage.getItem('ov:langs') || 'es,vi,zh');
+  const [code, setCode] = useState(null);
+  const [inputLang, setInputLang] = useState('AUTO');
+  const [langsCsv, setLangsCsv] = useState('es,vi,zh');
   const [running, setRunning] = useState(false);
   const [log, setLog] = useState([]);
   const mediaRef = useRef(null);
   const recRef = useRef(null);
 
   const siteOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://onevoice.church';
-  const listenerUrl = `${siteOrigin}/s/${encodeURIComponent(code)}`;
-  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(listenerUrl)}`;
+  const listenerUrl = code ? `${siteOrigin}/s/${encodeURIComponent(code)}` : '#';
+  const qrUrl = code
+    ? `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(listenerUrl)}`
+    : '';
 
+  // Load from localStorage only on client
   useEffect(() => {
-    localStorage.setItem('ov:lastCode', code);
-    localStorage.setItem('ov:inputLang', inputLang);
-    localStorage.setItem('ov:langs', langsCsv);
+    if (typeof window !== 'undefined') {
+      setCode(localStorage.getItem('ov:lastCode') || Math.random().toString(36).slice(2, 6).toUpperCase());
+      setInputLang(localStorage.getItem('ov:inputLang') || 'AUTO');
+      setLangsCsv(localStorage.getItem('ov:langs') || 'es,vi,zh');
+    }
+  }, []);
+
+  // Persist to localStorage
+  useEffect(() => {
+    if (typeof window !== 'undefined' && code) {
+      localStorage.setItem('ov:lastCode', code);
+      localStorage.setItem('ov:inputLang', inputLang);
+      localStorage.setItem('ov:langs', langsCsv);
+    }
   }, [code, inputLang, langsCsv]);
 
-  // live preview of the stream (English + first target)
+  // Live preview of the stream
   useEffect(() => {
     if (!code) return;
     const es = new EventSource(`/api/stream?code=${code}`);
@@ -84,8 +97,7 @@ export default function Operator() {
       }
     };
 
-    // send ~1s chunks
-    rec.start(1000);
+    rec.start(1000); // send ~1s chunks
     setRunning(true);
   }
 
@@ -101,19 +113,21 @@ export default function Operator() {
         <h1>🎚️ Operator Console (Whisper)</h1>
         <p style={{ opacity: 0.9 }}>Share the code/QR. Set input language (or Auto). Choose target languages (csv). Start the mic.</p>
 
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 16, alignItems: 'center' }}>
-          <div>
-            <div style={{ marginBottom: 6 }}>Access Code</div>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-              <code style={{ background: 'rgba(255,255,255,0.15)', padding: '6px 10px', borderRadius: 8, fontSize: 20 }}>{code}</code>
-              <button onClick={startSession} style={{ padding: '8px 12px', border: 'none', borderRadius: 8, fontWeight: 700, cursor: 'pointer' }}>New Session</button>
-              <a href={listenerUrl} target="_blank" rel="noreferrer" style={{ color: 'white', textDecoration: 'underline' }}>Open Listener</a>
+        {code && (
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 16, alignItems: 'center' }}>
+            <div>
+              <div style={{ marginBottom: 6 }}>Access Code</div>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                <code style={{ background: 'rgba(255,255,255,0.15)', padding: '6px 10px', borderRadius: 8, fontSize: 20 }}>{code}</code>
+                <button onClick={startSession} style={{ padding: '8px 12px', border: 'none', borderRadius: 8, fontWeight: 700, cursor: 'pointer' }}>New Session</button>
+                <a href={listenerUrl} target="_blank" rel="noreferrer" style={{ color: 'white', textDecoration: 'underline' }}>Open Listener</a>
+              </div>
+            </div>
+            <div style={{ justifySelf: 'end' }}>
+              {qrUrl && <img src={qrUrl} alt="QR" width={120} height={120} style={{ background: 'white', borderRadius: 8 }} />}
             </div>
           </div>
-          <div style={{ justifySelf: 'end' }}>
-            <img src={qrUrl} alt="QR" width={120} height={120} style={{ background: 'white', borderRadius: 8 }} />
-          </div>
-        </div>
+        )}
 
         <div style={{ display: 'flex', gap: 12, marginTop: 16, flexWrap: 'wrap' }}>
           <label>
@@ -153,7 +167,6 @@ export default function Operator() {
         <h3 style={{ marginTop: 18 }}>Live Preview</h3>
         <div style={{ background: '#0b1220', color: 'white', padding: 12, borderRadius: 8, minHeight: 160, lineHeight: 1.6 }}>
           {log.map((l) => {
-            // pick first offered language to preview
             const first = (langsCsv || 'es').split(',')[0].trim();
             return (
               <div key={l.ts} style={{ marginBottom: 8 }}>
