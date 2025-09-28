@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server";
-import { createSession, endSession, getSession } from "../_lib/sessionStore";
+import { newCode, createSession, endSession, getSession } from "../_lib/sessionStore";
 
-export async function POST() {
-  const code = createSession();
+export async function POST(req) {
+  // optional: accept a code to reuse; otherwise generate
+  const code = newCode();
+  createSession(code);
   return NextResponse.json({ code });
 }
 
