@@ -1,3 +1,5 @@
+// app/app/api/_lib/sessionStore.js
+
 // Simple in-memory store for demo. We'll swap to Vercel KV later.
 const sessions = new Map();
 // code -> { active: true, lines: [], listeners: Set(res) }
@@ -16,13 +18,19 @@ export function endSession(code) {
   if (!s) return false;
   s.active = false;
   for (const res of s.listeners) {
-    try { res.write(`event: end\ndata: {}\n\n`); res.flush?.(); res.end(); } catch {}
+    try {
+      res.write(`event: end\ndata: {}\n\n`);
+      res.flush?.();
+      res.end();
+    } catch {}
   }
   sessions.delete(code);
   return true;
 }
 
-export function getSession(code) { return sessions.get(code); }
+export function getSession(code) {
+  return sessions.get(code);
+}
 
 export function addLine(code, line) {
   const s = sessions.get(code);
