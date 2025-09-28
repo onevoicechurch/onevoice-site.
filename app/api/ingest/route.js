@@ -2,55 +2,67 @@ import OpenAI from "openai";
 import { NextResponse } from "next/server";
 import { addLine, getSession } from "../_lib/sessionStore";
 
+export const runtime = "nodejs"; // needs Node for Buffer/File
+
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// We accept small audio chunks (webm/ogg) and a target language, then:
-// 1) transcribe with OpenAI
-// 2) translate with OpenAI
-// 3) broadcast to listeners via addLine()
 export async function POST(req) {
-  const contentType = req.headers.get("content-type") || "";
   const url = new URL(req.url);
-  const code = url.searchParams.get("code");      // session code
-  const lang = url.searchParams.get("lang") || "es"; // operator's default target
+  const code = url.searchParams.get("code");          // session code, required
+  const inputLang = url.searchParams.get("inputLang") || "AUTO"; // e.g., en-US or AUTO
+  // langs to translate into (csv of BCP-47 or ISO-ish 2-letter: "es,vi,zh")
+  const langs = (url.searchParams.get("langs") || "es").split(",").map(s => s.trim()).filter(Boolean);
+
   if (!code || !getSession(code)) {
-    return NextResponse.json({ ok: false, error: "Invalid session" }, { status: 400 });
+    return NextResponse.json({ ok: false, error: "Invalid session code" }, { status: 400 });
   }
 
-  // Expect raw audio blob
-  const audioArrayBuffer = await req.arrayBuffer();
-  const audioBuffer = Buffer.from(audioArrayBuffer);
+  // Expect raw audio in body (webm/ogg), use content-type as a hint
+  const contentType = req.headers.get("content-type") || "audio/webm";
+  const abuf = await req.arrayBuffer();
+  const buf = Buffer.from(abuf);
 
   try {
-    // 1) Transcribe ( Whisper via file upload API )
+    // --- 1) Transcription (Whisper) ---
+    // Upload the chunk as a File; whisper can accept a language hint (like "en")
+    const langHint = inputLang && inputLang !== "AUTO" ? inputLang.split("-")[0] : undefined;
+
     const file = await openai.files.create({
-      file: new File([audioBuffer], "chunk.webm", { type: contentType || "audio/webm" }),
+      file: new File([buf], "chunk.webm", { type: contentType }),
       purpose: "transcriptions",
     });
 
-    const transcript = await openai.audio.transcriptions.create({
+    const trans = await openai.audio.transcriptions.create({
       file: file.id,
       model: "whisper-1",
-      response_format: "text",
+      // language: langHint, // uncomment to force language; leave undefined for auto-detect
+      response_format: "text"
     });
 
-    const text = (transcript || "").trim();
-    if (!text) return NextResponse.json({ ok: true, empty: true });
+    const enText = (trans || "").trim();
+    if (!enText) return NextResponse.json({ ok: true, empty: true });
 
-    // 2) Translate
-    const translationRes = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: "Translate user text into the requested language ONLY. Keep it concise; no commentary." },
-        { role: "user", content: `Language: ${lang}\nText: ${text}` },
-      ],
-      temperature: 0.2,
-    });
+    // --- 2) Translate to requested languages (server-side, one time) ---
+    async function translateTo(code2) {
+      const sys = `Translate this English text into ${code2}. Output only the translation.`;
+      const r = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: sys },
+          { role: "user", content: enText }
+        ],
+        temperature: 0.2,
+      });
+      return (r.choices?.[0]?.message?.content || "").trim();
+    }
 
-    const translated = translationRes.choices[0]?.message?.content?.trim() || "";
+    const tx = {};
+    for (const lc of langs) {
+      tx[lc] = await translateTo(lc);
+    }
 
-    // 3) Broadcast line (we keep both original + translated)
-    const line = { ts: Date.now(), text, translated, lang };
+    // --- 3) Broadcast one payload to all listeners ---
+    const line = { ts: Date.now(), en: enText, tx };
     addLine(code, line);
 
     return NextResponse.json({ ok: true });
