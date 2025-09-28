@@ -12,10 +12,14 @@ export default function Home() {
   return (
     <main style={bg}>
       <div style={{ textAlign: "center" }}>
-        <h1 style={{ fontSize: "48px", marginBottom: "12px" }}>Welcome to OneVoice 🎤</h1>
+        <h1 style={{ fontSize: "48px", marginBottom: "12px" }}>
+          Welcome to OneVoice 🎤
+        </h1>
         <p style={{ opacity: 0.9, marginBottom: "24px" }}>
           Real-time translation built for churches.
         </p>
+
+        {/* Main button */}
         <Link
           href="/translate"
           style={{
@@ -29,11 +33,17 @@ export default function Home() {
         >
           Try the Translator
         </Link>
+
+        {/* Extra navigation links */}
+        <div style={{ marginTop: 24 }}>
+          <a href="/operator" style={{ marginRight: 12 }}>
+            Go to Operator Console →
+          </a>
+          <a href="/s/DEMO">
+            Try Listener (DEMO code) →
+          </a>
+        </div>
       </div>
     </main>
   );
 }
-<div style={{ marginTop: 24 }}>
-  <a href="/operator" style={{ marginRight: 12 }}>Go to Operator Console →</a>
-  <a href="/s/DEMO">Try Listener (DEMO code) →</a>
-</div>
