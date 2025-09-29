@@ -1,72 +1,112 @@
 // app/api/ingest/route.js
-export const runtime = 'nodejs';          // needed to use FormData/Buffer on Vercel
-export const dynamic = 'force-dynamic';   // this route is always dynamic
+export const runtime = 'nodejs'; // use Node runtime (multipart/form-data friendly)
 
 import { NextResponse } from "next/server";
-import { addLine, getSession } from "../../_lib/sessionStore";
+import { addLine, getSession } from "../_lib/sessionStore";
+
+// OPTIONAL: tweak these
+const TRANSCRIBE_MODEL = "whisper-1";
+const TRANSLATE_MODEL = "gpt-4o-mini"; // fast & cheap; returns JSON
 
 export async function POST(req) {
   try {
-    // ---- read query params ----
-    const searchParams = new URL(req.url).searchParams;
-    const code = searchParams.get("code");
-    const inputLang = searchParams.get("inputLang") || "AUTO";
-    const langs = (searchParams.get("langs") || "es").split(",").map(s => s.trim()).filter(Boolean);
+    const url = new URL(req.url);
+    const code = url.searchParams.get("code");
+    const inputLang = url.searchParams.get("inputLang") || "AUTO";
+    const langs = (url.searchParams.get("langs") || "es").split(",").map(s => s.trim()).filter(Boolean);
 
-    // ---- validate session ----
     const session = getSession(code);
     if (!code || !session) {
       return NextResponse.json({ ok: false, error: "No such session" }, { status: 404 });
     }
 
-    // ---- read binary audio from request ----
+    // Read raw audio body
     const contentType = req.headers.get("content-type") || "audio/webm";
     const ab = await req.arrayBuffer();
-    const buf = Buffer.from(ab);
-    const file = new Blob([buf], { type: contentType });
 
-    // ---- send to OpenAI Whisper for transcription ----
-    // Make sure OPENAI_API_KEY is set in Vercel → Project → Settings → Environment Variables
+    // --- 1) Transcribe with Whisper ---
     const form = new FormData();
-    form.append("file", file, "chunk.webm");
-    form.append("model", "whisper-1");
-    // Let Whisper auto-detect unless a specific input language was chosen
+    const blob = new Blob([ab], { type: contentType });
+    form.append("file", blob, "chunk.webm");
+    form.append("model", TRANSCRIBE_MODEL);
     if (inputLang && inputLang !== "AUTO") {
-      // whisper expects short language codes like "en", "es", "vi"
-      form.append("language", inputLang.split("-")[0]);
+      // Whisper expects BCP-47 or ISO 639-1. If you pass "en-US" it's fine; if missing, it auto-detects.
+      form.append("language", inputLang);
     }
 
-    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    const transcribeRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
       method: "POST",
-      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
       body: form,
     });
 
-    if (!r.ok) {
-      const errTxt = await r.text().catch(() => "");
-      console.error("Whisper error:", r.status, errTxt);
-      return NextResponse.json({ ok: false, error: "Transcription failed" }, { status: 502 });
+    if (!transcribeRes.ok) {
+      const errText = await transcribeRes.text().catch(() => "");
+      console.error("Whisper error:", errText);
+      return NextResponse.json({ ok: false, error: "Transcription failed" }, { status: 500 });
     }
 
-    const data = await r.json();
-    const text = (data && data.text) ? data.text.trim() : "";
-    if (!text) {
-      // no speech in this chunk; just acknowledge
-      return NextResponse.json({ ok: true, empty: true });
+    const transcription = await transcribeRes.json();
+    const enText = (transcription.text || "").trim();
+    if (!enText) {
+      return NextResponse.json({ ok: true, skipped: true });
     }
 
-    // ---- simple “translations”: reuse the same text per language for now ----
-    // (We can swap this for real translations after transcription is working.)
-    const tx = Object.fromEntries(langs.map(l => [l, text]));
+    // --- 2) Translate the English transcript into the requested languages in one call ---
+    const translatePrompt = [
+      {
+        role: "system",
+        content:
+          "You translate English text into specific languages and return strict JSON only. " +
+          "Keys must be the exact language codes provided. If a language is unknown, use an empty string."
+      },
+      {
+        role: "user",
+        content:
+          `Translate the following English text into each of these language codes ${JSON.stringify(langs)}.\n` +
+          `Return ONLY JSON like {"es":"...", "vi":"..."} with no extra text.\n\n` +
+          `English: ${enText}`
+      }
+    ];
 
-    // ---- push line into the session (fans out to listeners) ----
+    const translateRes = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: TRANSLATE_MODEL,
+        temperature: 0.2,
+        messages: translatePrompt
+      })
+    });
+
+    let tx = {};
+    if (translateRes.ok) {
+      const j = await translateRes.json();
+      const raw = j.choices?.[0]?.message?.content || "{}";
+      try {
+        tx = JSON.parse(raw);
+      } catch {
+        // If parsing fails, just leave translations empty
+        tx = Object.fromEntries(langs.map(l => [l, ""]));
+      }
+    } else {
+      // Translation failed; still return English
+      tx = Object.fromEntries(langs.map(l => [l, ""]));
+    }
+
+    // --- 3) Push a line to the session stream ---
     const line = {
       ts: Date.now(),
-      en: text,  // store under 'en' for preview
-      tx,        // { es: "...", vi: "...", ... }
+      en: enText,
+      tx, // e.g. { es: "...", vi: "...", zh: "..." }
     };
-    addLine(code, line);
 
+    addLine(code, line);
     return NextResponse.json({ ok: true });
   } catch (err) {
     console.error("ingest route error", err);
