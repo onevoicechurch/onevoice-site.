@@ -1,36 +1,37 @@
-import { getSession, attachListener, detachListener } from "../_lib/sessionStore";
+import { NextResponse } from 'next/server';
+import { getSession, attachListener, detachListener } from '../_lib/sessionStore';
+
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 export async function GET(req) {
-  const code = new URL(req.url).searchParams.get("code") || "";
+  const code = new URL(req.url).searchParams.get('code') || '';
   const session = getSession(code);
   if (!code || !session) {
-    return new Response(JSON.stringify({ ok: false, error: "No such session" }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    });
+    return NextResponse.json({ ok: false, error: 'No such session' }, { status: 404 });
   }
 
-  return new Response(
-    new ReadableStream({
-      start(controller) {
-        const res = {
-          write: (chunk) => controller.enqueue(new TextEncoder().encode(chunk)),
-          flush: () => {},
-          end: () => controller.close(),
-        };
-        attachListener(code, res);
-      },
-      cancel() {
-        // best-effort; we don't have the `res` reference here
-      },
-    }),
-    {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache, no-transform",
-        Connection: "keep-alive",
-        "X-Accel-Buffering": "no",
-      },
-    }
-  );
+  let resObj = null;
+
+  const stream = new ReadableStream({
+    start(controller) {
+      resObj = {
+        write: (chunk) => controller.enqueue(new TextEncoder().encode(chunk)),
+        flush: () => {},
+        end: () => controller.close(),
+      };
+      attachListener(code, resObj);
+    },
+    cancel() {
+      if (resObj) detachListener(code, resObj);
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    },
+  });
 }
