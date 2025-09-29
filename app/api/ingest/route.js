@@ -3,7 +3,8 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 import { NextResponse } from 'next/server';
-import { addLine, getSession } from '@/app/api/_lib/sessionStore';
+// ✅ use a relative path (one folder up from /ingest to /api, then _lib/sessionStore.js)
+import { addLine, getSession } from '../_lib/sessionStore';
 
 const MIN_BYTES = 3500; // drop tiny blobs
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -36,7 +37,7 @@ async function transcribeWithFallback(ab, contentType, inputLang) {
 
     if (r.ok) return (await r.json())?.text?.trim() || '';
 
-    // If it looks like a format/corruption 400, we’ll try whisper-1 next
+    // If it looks like a format/corruption 400, try whisper-1 next
     if (r.status !== 400) {
       const t = await r.text().catch(() => '');
       throw new Error(`transcribe failed (${r.status}): ${t}`);
