@@ -14,9 +14,8 @@ const INPUT_LANGS = [
   { code: 'vi-VN', label: 'Vietnamese (Vietnam)' },
 ];
 
-// Mic → send ~1.5s chunks, ignore tiny blobs
-const CHUNK_MS   = 1500;
-const MIN_SEND_B = 6000;
+const CHUNK_MS   = 1800;   // a touch larger than before to capture full phrases
+const MIN_SEND_B = 10000;  // drop tiny blobs hard (they cause 400s)
 
 export default function Operator() {
   const [code, setCode] = useState(null);
@@ -34,7 +33,6 @@ export default function Operator() {
     ? `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(listenerUrl)}`
     : '';
 
-  // prefs
   useEffect(() => {
     if (typeof window === 'undefined') return;
     setCode(localStorage.getItem('ov:lastCode') || Math.random().toString(36).slice(2, 6).toUpperCase());
@@ -48,7 +46,6 @@ export default function Operator() {
     localStorage.setItem('ov:langs', langsCsv);
   }, [code, inputLang, langsCsv]);
 
-  // live preview (SSE)
   useEffect(() => {
     if (!code) return;
     const es = new EventSource(`/api/stream?code=${encodeURIComponent(code)}`);
@@ -97,7 +94,7 @@ export default function Operator() {
         const ab = await e.data.arrayBuffer();
         await fetch('/api/ingest?' + qs.toString(), {
           method: 'POST',
-          headers: { 'Content-Type': 'audio/webm' }, // normalize header
+          headers: { 'Content-Type': 'audio/webm' }, // normalize header (no codecs)
           body: ab,
         });
       } catch (err) {
