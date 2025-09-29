@@ -1,70 +1,53 @@
 // /app/api/ingest/route.js
-// Ingest mic chunks from the Operator, transcribe with OpenAI,
-// translate to the requested target languages, and push lines
-// to all listeners via the in-memory session store.
+// Receives mic chunks, transcribes with OpenAI, translates, and broadcasts.
 
-export const runtime = "nodejs";           // <-- important on Vercel
-export const dynamic = "force-dynamic";    // avoid any static assumptions
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
 import { addLine, getSession } from "../_lib/sessionStore";
 
-// Helper: tiny guard so we don't waste $$ on silence/tiny bursts
-const MIN_BYTES = 1200; // ~1s webm often > 1.5KB; tweak if needed
-
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // set in Vercel → Project → Settings → Environment Variables
+const MIN_BYTES = 1000; // ignore very tiny chunks
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 export async function POST(req) {
   try {
-    // --- read query params ---
+    // --- query params ---
     const url = new URL(req.url);
     const code = url.searchParams.get("code") || "";
-    const inputLang = url.searchParams.get("inputLang") || "AUTO"; // e.g. "en-US" or "AUTO"
+    const inputLang = url.searchParams.get("inputLang") || "AUTO";
     const langsCsv = url.searchParams.get("langs") || "es";
-    const targetLangs = langsCsv
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean); // e.g. ["es","vi","zh"]
+    const targetLangs = langsCsv.split(",").map(s => s.trim()).filter(Boolean);
 
-    // --- validate session ---
+    // --- validate ---
     const session = getSession(code);
     if (!code || !session) {
       return NextResponse.json({ ok: false, error: "No such session" }, { status: 404 });
     }
-
     if (!OPENAI_API_KEY) {
-      return NextResponse.json(
-        { ok: false, error: "Missing OPENAI_API_KEY env var" },
-        { status: 500 }
-      );
+      return NextResponse.json({ ok: false, error: "Missing OPENAI_API_KEY" }, { status: 500 });
     }
 
-    // --- read the raw audio chunk ---
+    // --- read raw audio bytes ---
     const ab = await req.arrayBuffer();
     const bytes = ab.byteLength || 0;
     if (bytes < MIN_BYTES) {
-      // Drop very tiny chunks (prevents spamming and saves cost)
       return NextResponse.json({ ok: true, skipped: "tiny_chunk" });
     }
 
-    // Build a filename with a plausible extension for Whisper
-    // Most browsers produce audio/webm; we’ll default to webm if missing.
+    // figure out a reasonable file extension
     const contentType = req.headers.get("content-type") || "audio/webm";
     const ext =
       contentType.includes("wav") ? "wav" :
       contentType.includes("mp3") ? "mp3" :
       contentType.includes("ogg") ? "ogg" :
-      contentType.includes("m4a") ? "m4a" :
-      "webm";
+      contentType.includes("m4a") ? "m4a" : "webm";
 
-    // --- Transcribe with Whisper (server-side multipart form) ---
-    // Model options: "whisper-1" or "gpt-4o-transcribe" (if enabled on your account).
+    // --- TRANSCRIBE (OpenAI) ---
+    // prefer the current small STT model
     const form = new FormData();
     form.append("file", new Blob([ab], { type: contentType }), `clip.${ext}`);
-    form.append("model", "whisper-1");
-
-    // If you want to hint the language (faster/cheaper than autodetect):
-    // Whisper expects BCP-47-ish or ISO language names; we’ll pass only the primary code.
+    form.append("model", "gpt-4o-mini-transcribe");
     if (inputLang && inputLang !== "AUTO") {
       const primary = inputLang.split("-")[0]; // "en-US" -> "en"
       form.append("language", primary);
@@ -78,11 +61,11 @@ export async function POST(req) {
 
     if (!txResp.ok) {
       const errText = await txResp.text().catch(() => "");
-      // Still append a diagnostic line so the Operator sees something
+      // show a short diagnostic in Operator Live Preview
       addLine(code, {
         ts: Date.now(),
-        en: `[transcribe error ${txResp.status}]`,
-        tx: Object.fromEntries(targetLangs.map((l) => [l, ""])),
+        en: `[transcribe error ${txResp.status}] ${errText.slice(0, 120)}`,
+        tx: Object.fromEntries(targetLangs.map(l => [l, ""])),
       });
       return NextResponse.json(
         { ok: false, error: "transcription_failed", detail: errText },
@@ -92,15 +75,11 @@ export async function POST(req) {
 
     const txJson = await txResp.json();
     const englishText = (txJson?.text || "").trim();
-
-    // If Whisper returned nothing (silence/noise), don’t fan out translators
     if (!englishText) {
       return NextResponse.json({ ok: true, empty: true });
     }
 
-    // --- Translate to requested target languages (parallel) ---
-    // We’ll use a lightweight model for translation.
-    // If your account has different naming, swap to a small chat model you have (e.g. "gpt-4o-mini").
+    // --- TRANSLATE (parallel) ---
     async function translateOne(target) {
       const prompt = `Translate the following text into ${target}. Return only the translation with no quotes:\n\n${englishText}`;
       const r = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -115,32 +94,32 @@ export async function POST(req) {
           temperature: 0.2,
         }),
       });
-
-      if (!r.ok) {
-        return "";
-      }
-
+      if (!r.ok) return "";
       const j = await r.json();
       return (j?.choices?.[0]?.message?.content || "").trim();
     }
 
     const translations = Object.fromEntries(
-      await Promise.all(
-        targetLangs.map(async (lang) => [lang, await translateOne(lang)])
-      )
+      await Promise.all(targetLangs.map(async l => [l, await translateOne(l)]))
     );
 
-    // --- Broadcast the line to listeners + show in Operator Live Preview ---
-    const line = {
-      ts: Date.now(),
-      en: englishText,
-      tx: translations, // e.g. { es: "...", vi: "...", zh: "..." }
-    };
-    addLine(code, line);
+    // --- BROADCAST ---
+    addLine(code, { ts: Date.now(), en: englishText, tx: translations });
 
     return NextResponse.json({ ok: true });
   } catch (err) {
-    console.error("ingest fatal error", err);
+    // bubble a short error into the preview to help debug
+    try {
+      const url = new URL(req.url);
+      const code = url.searchParams.get("code") || "";
+      if (code) {
+        addLine(code, {
+          ts: Date.now(),
+          en: `[server error] ${String(err?.message || err).slice(0, 120)}`,
+          tx: {},
+        });
+      }
+    } catch {}
     return NextResponse.json({ ok: false, error: "server_error" }, { status: 500 });
   }
 }
