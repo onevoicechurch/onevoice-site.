@@ -4,71 +4,72 @@ export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { addLine, getSession } from "../_lib/sessionStore";
 
-const MIN_BYTES = 3500; // drop tiny blobs
+// Drop tiny payloads completely — they tend to trigger 400s.
+const MIN_BYTES = 6000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
+function pickExtFromContentType(ct) {
+  if (!ct) return "webm";
+  if (ct.includes("wav")) return "wav";
+  if (ct.includes("mp3")) return "mp3";
+  if (ct.includes("ogg")) return "ogg";
+  if (ct.includes("m4a")) return "m4a";
+  if (ct.includes("mp4")) return "mp4";
+  if (ct.includes("mpeg") || ct.includes("mpga")) return "mp3";
+  return "webm";
+}
+
+// Try whisper-1 first (more forgiving). If it 400s for format, try 4o-mini-transcribe.
 async function transcribeWithFallback(ab, contentType, inputLang) {
-  const ext =
-    contentType?.includes("wav") ? "wav" :
-    contentType?.includes("mp3") ? "mp3" :
-    contentType?.includes("ogg") ? "ogg" :
-    contentType?.includes("m4a") ? "m4a" : "webm";
+  const ext = pickExtFromContentType(contentType);
+  // Normalize to a proper File; avoid passing through the browser's codecs string.
+  const file = new File([ab], `clip.${ext}`, { type: "audio/webm" });
 
-  // Normalize Blob type to plain "audio/webm" (avoid ";codecs=opus" confusion)
-  const file = new Blob([ab], { type: "audio/webm" });
-
-  // Try gpt-4o-mini-transcribe
-  {
+  // Helper to call OpenAI transcription endpoint
+  async function callTranscribe(model) {
     const fd = new FormData();
-    fd.append("file", file, `clip.${ext}`);
-    fd.append("model", "gpt-4o-mini-transcribe");
+    fd.append("file", file);
+    fd.append("model", model);
     if (inputLang && inputLang !== "AUTO") {
-      const primary = inputLang.split("-")[0];
-      fd.append("language", primary);
+      // openai expects primary code like "en", "es"
+      fd.append("language", inputLang.split("-")[0]);
     }
-
     const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
       method: "POST",
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
       body: fd,
     });
+    return r;
+  }
 
+  // 1) whisper-1
+  {
+    const r = await callTranscribe("whisper-1");
     if (r.ok) {
       const j = await r.json();
       return (j?.text || "").trim();
     }
-
-    // Only fall back on 400 (format/corruption). Other errors -> throw.
+    // Only fall back on obvious format/corruption 400s; otherwise throw.
     if (r.status !== 400) {
       const t = await r.text().catch(() => "");
-      throw new Error(`transcribe failed (${r.status}): ${t}`);
+      throw new Error(`whisper-1 failed (${r.status}): ${t}`);
     }
   }
 
-  // Fall back: whisper-1
-  const fd2 = new FormData();
-  fd2.append("file", file, `clip.${ext}`);
-  fd2.append("model", "whisper-1");
-  if (inputLang && inputLang !== "AUTO") {
-    const primary = inputLang.split("-")[0];
-    fd2.append("language", primary);
+  // 2) gpt-4o-mini-transcribe (fallback)
+  {
+    const r = await callTranscribe("gpt-4o-mini-transcribe");
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      throw new Error(`4o-mini-transcribe failed (${r.status}): ${t}`);
+    }
+    const j = await r.json();
+    return (j?.text || "").trim();
   }
-
-  const r2 = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: fd2,
-  });
-
-  if (!r2.ok) {
-    const t = await r2.text().catch(() => "");
-    throw new Error(`whisper-1 failed (${r2.status}): ${t}`);
-  }
-  const j2 = await r2.json();
-  return (j2?.text || "").trim();
 }
 
 async function translateAll(englishText, targets) {
+  if (!targets.length) return {};
   const results = await Promise.all(
     targets.map(async (lang) => {
       const r = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -79,10 +80,10 @@ async function translateAll(englishText, targets) {
         },
         body: JSON.stringify({
           model: "gpt-4o-mini",
-          temperature: 0.2,
+          temperature: 0, // keep translations steady
           messages: [
             { role: "system", content: `Translate into ${lang}. Return only the translation.` },
-            { role: "user", content: englishText }
+            { role: "user", content: englishText },
           ],
         }),
       });
@@ -113,6 +114,7 @@ export async function POST(req) {
     const ab = await req.arrayBuffer();
     const bytes = ab.byteLength || 0;
     if (bytes < MIN_BYTES) {
+      // Too tiny — skip to avoid the noisy 400 loop.
       return NextResponse.json({ ok: true, skipped: "tiny" });
     }
 
@@ -135,9 +137,7 @@ export async function POST(req) {
     }
 
     const translations = await translateAll(englishText, targetLangs);
-
     addLine(code, { ts: Date.now(), en: englishText, tx: translations });
-
     return NextResponse.json({ ok: true });
   } catch (err) {
     console.error("ingest fatal", err);
