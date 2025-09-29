@@ -1,28 +1,59 @@
-// /app/api/session/route.js
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
+// Simple in-memory store (reset on each deploy)
+const sessions = new Map();
+// code -> { active: true, lines: [], listeners: Set(res) }
 
-import { NextResponse } from "next/server";
-import { newCode, createSession, endSession, getSession } from "../_lib/sessionStore";
-
-// Create a new session
-export async function POST() {
-  const code = newCode();
-  createSession(code);
-  return NextResponse.json({ code });
+export function newCode() {
+  return Math.random().toString(36).slice(2, 6).toUpperCase();
 }
 
-// End an existing session
-export async function DELETE(req) {
-  const code = new URL(req.url).searchParams.get("code");
+export function createSession(code) {
+  sessions.set(code, { active: true, lines: [], listeners: new Set() });
+  return code;
+}
 
-  if (!code || !getSession(code)) {
-    return NextResponse.json(
-      { ok: false, error: "No such session" },
-      { status: 404 }
-    );
+export function endSession(code) {
+  const s = sessions.get(code);
+  if (!s) return false;
+  s.active = false;
+  for (const res of s.listeners) {
+    try {
+      res.write?.(`event: end\ndata: {}\n\n`);
+      res.flush?.();
+      res.end?.();
+    } catch {}
   }
+  sessions.delete(code);
+  return true;
+}
 
-  endSession(code);
-  return NextResponse.json({ ok: true });
+export function getSession(code) {
+  return sessions.get(code);
+}
+
+export function addLine(code, line) {
+  const s = sessions.get(code);
+  if (!s || !s.active) return false;
+  s.lines.push(line);
+  const payload = JSON.stringify(line);
+  for (const res of s.listeners) {
+    res.write?.(`data: ${payload}\n\n`);
+    res.flush?.();
+  }
+  return true;
+}
+
+export function attachListener(code, res) {
+  const s = sessions.get(code);
+  if (!s || !s.active) return false;
+  s.listeners.add(res);
+  // send history
+  for (const line of s.lines) {
+    res.write?.(`data: ${JSON.stringify(line)}\n\n`);
+  }
+  return true;
+}
+
+export function detachListener(code, res) {
+  const s = sessions.get(code);
+  if (s) s.listeners.delete(res);
 }
