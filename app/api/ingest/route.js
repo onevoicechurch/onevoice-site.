@@ -1,151 +1,133 @@
-// app/api/ingest/route.js
-// Accepts small audio chunks from the Operator, transcribes with Whisper,
-// translates with GPT, and pushes a line into the in-memory session store.
-
+// app/api/ingest/route.js  (PRODUCTION: real transcription + translation)
 import { NextResponse } from "next/server";
-import { getSession, addLine } from "../_lib/sessionStore";
+import { addLine, getSession } from "../../_lib/sessionStore";
 
-export const runtime = "nodejs"; // we need Node (multipart/form-data, fetch to OpenAI)
+// ---- CONFIG ----
+// Speech-to-text model (fast + good): try "gpt-4o-mini-transcribe" if available.
+// Fallback to "whisper-1" if your account doesn't have the newer model.
+const STT_MODEL = process.env.OV_STT_MODEL || "whisper-1";
+// Text translation model:
+const TRANSLATE_MODEL = process.env.OV_TX_MODEL || "gpt-4o-mini";
+// --------------
 
-// OPTIONAL: set a hard limit to keep chunks small (you’re sending ~1s chunks)
-const MAX_BYTES = 10 * 1024 * 1024; // 10 MB
+// Keep on Node runtime (NOT edge) since we post multipart to OpenAI
+export const runtime = "node";
+export const dynamic = "force-dynamic";
 
 export async function POST(req) {
   try {
-    // ----- Query params -----
     const url = new URL(req.url);
     const code = url.searchParams.get("code") || "";
-    const inputLang = (url.searchParams.get("inputLang") || "AUTO").trim();
-    const langsCsv = (url.searchParams.get("langs") || "es").trim();
-    const targetLangs = langsCsv.split(",").map((s) => s.trim()).filter(Boolean);
+    const inputLang = url.searchParams.get("inputLang") || "AUTO";
+    const langs =
+      (url.searchParams.get("langs") || "es")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
 
-    // Validate session
     const session = getSession(code);
-    if (!code || !session) {
+    if (!session) {
       return NextResponse.json({ ok: false, error: "No such session" }, { status: 404 });
     }
 
-    // ----- Read audio -----
+    // Read mic chunk
     const ab = await req.arrayBuffer();
-    if (!ab || ab.byteLength === 0) {
-      return NextResponse.json({ ok: false, error: "No audio data" }, { status: 400 });
-    }
-    if (ab.byteLength > MAX_BYTES) {
-      return NextResponse.json({ ok: false, error: "Chunk too large" }, { status: 413 });
-    }
-
-    // ----- Transcribe with Whisper -----
-    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-    if (!OPENAI_API_KEY) {
-      return NextResponse.json({ ok: false, error: "Missing OPENAI_API_KEY" }, { status: 500 });
+    const bytes = ab.byteLength || 0;
+    if (bytes < 1500) {
+      // ignore tiny/noise chunks to save $$
+      return NextResponse.json({ ok: true, skipped: "small chunk" });
     }
 
-    // Build multipart form-data
+    // ---- 1) TRANSCRIBE (speech -> English text) ----
+    // Build multipart/form-data for OpenAI /audio/transcriptions
     const form = new FormData();
-    // Whisper expects a file; give it a name + MIME type (webm/ogg etc. both work if content matches)
-    const blob = new Blob([ab], { type: "audio/webm" });
-    form.append("file", blob, "chunk.webm");
-    form.append("model", "whisper-1"); // Stable as of now
-    if (inputLang && inputLang !== "AUTO") {
-      // If you choose a specific language (e.g. "en"), give Whisper the hint
-      // Whisper expects ISO 639-1 like "en", "es" (not a locale like en-US)
-      form.append("language", inputLang.split("-")[0]);
+    const file = new Blob([ab], { type: req.headers.get("content-type") || "audio/webm" });
+    form.append("file", file, "chunk.webm");
+    form.append("model", STT_MODEL);
+
+    // If you *know* the spoken language (e.g., "en", "es", "vi"), you can hint it:
+    // - whisper-1 uses "language" (ISO-639-1 like "en", "es")
+    // - gpt-4o-mini-transcribe auto-detects; we keep a hint for whisper-1 only
+    if (STT_MODEL === "whisper-1" && inputLang && inputLang !== "AUTO") {
+      // extract primary code like "en" from "en-US"
+      const hint = inputLang.split("-")[0].toLowerCase();
+      form.append("language", hint);
     }
 
-    const tRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    const sttRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
       method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
       body: form,
     });
 
-    if (!tRes.ok) {
-      const errText = await safeText(tRes);
-      return NextResponse.json(
-        { ok: false, error: `Whisper failed: ${tRes.status} ${errText}` },
-        { status: 502 }
-      );
+    if (!sttRes.ok) {
+      const errText = await sttRes.text();
+      console.error("STT error:", errText);
+      return NextResponse.json({ ok: false, error: "stt_failed" }, { status: 502 });
     }
-    const tJson = await tRes.json();
-    const english = (tJson.text || "").trim();
 
-    // If nothing meaningful was heard, stop here quietly.
+    const sttJson = await sttRes.json();
+    const english = (sttJson.text || "").trim();
     if (!english) {
-      return NextResponse.json({ ok: true, skipped: "empty transcription" });
+      return NextResponse.json({ ok: true, note: "no speech detected" });
     }
 
-    // ----- Translate with GPT (single JSON response for all target languages) -----
-    // You can swap to a different model if you prefer.
-    const model = "gpt-4o-mini";
+    // ---- 2) TRANSLATE (English -> each target language) ----
+    const txMap = {};
+    for (const l of langs) {
+      try {
+        // Ask the model to ONLY return the translation, no extra text.
+        const prompt = [
+          {
+            role: "system",
+            content: `You are a translator. Translate the user's message into the target language specified. 
+Return ONLY the translated sentence with no quotes or commentary.`,
+          },
+          {
+            role: "user",
+            content: `Target language: ${l}\nText: ${english}`,
+          },
+        ];
 
-    const prompt = [
-      {
-        role: "system",
-        content:
-          "You are a fast, accurate live-translation helper. Translate the given English text into each requested target language. Strictly return a single JSON object whose keys are the language codes and whose values are the translations. Do not include anything else.",
-      },
-      {
-        role: "user",
-        content: JSON.stringify({
-          text: english,
-          target_langs: targetLangs, // e.g. ["es","vi","zh"]
-        }),
-      },
-    ];
+        const tRes = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          },
+          body: JSON.stringify({
+            model: TRANSLATE_MODEL,
+            messages: prompt,
+            temperature: 0.2,
+          }),
+        });
 
-    const jRes = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model,
-        response_format: { type: "json_object" },
-        temperature: 0.2,
-        messages: prompt,
-      }),
-    });
-
-    if (!jRes.ok) {
-      const errText = await safeText(jRes);
-      return NextResponse.json(
-        { ok: false, error: `Translate failed: ${jRes.status} ${errText}` },
-        { status: 502 }
-      );
+        if (!tRes.ok) {
+          const txErr = await tRes.text();
+          console.error("TX error:", l, txErr);
+          continue;
+        }
+        const tJson = await tRes.json();
+        const out =
+          tJson.choices?.[0]?.message?.content?.trim() ||
+          "";
+        if (out) txMap[l] = out;
+      } catch (e) {
+        console.error("translate catch:", l, e);
+      }
     }
 
-    const j = await jRes.json();
-    const content = j.choices?.[0]?.message?.content || "{}";
-
-    let translations = {};
-    try {
-      translations = JSON.parse(content);
-    } catch {
-      // If parsing fails, just fall back to empty translations
-      translations = {};
-    }
-
-    // ----- Push a line to the session -----
+    // ---- 3) Broadcast to listeners (and show in Live Preview) ----
     const line = {
       ts: Date.now(),
       en: english,
-      tx: translations, // { es: "...", vi: "...", zh: "..." }
+      tx: txMap,
     };
-
     addLine(code, line);
 
     return NextResponse.json({ ok: true });
   } catch (err) {
-    console.error("ingest error", err);
-    return NextResponse.json({ ok: false, error: "Server error" }, { status: 500 });
-  }
-}
-
-// tiny helper to avoid throwing when reading error bodies
-async function safeText(res) {
-  try {
-    return await res.text();
-  } catch {
-    return "";
+    console.error("ingest error:", err);
+    return NextResponse.json({ ok: false, error: "ingest_error" }, { status: 500 });
   }
 }
