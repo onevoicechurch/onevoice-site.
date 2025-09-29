@@ -1,16 +1,9 @@
+// /app/operator/page.js
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
 
-/**
- * ===== TUNING =====
- * Slightly larger chunks + stricter min size = fewer “one-word” lines
- * and fewer 400s from the API.
- */
-const CHUNK_MS   = 2000;  // ~2.0s mic chunks
-const MIN_SEND_B = 8000;  // drop tiny blobs before sending
-// ===================
-
+// ----- UI language choices -----
 const INPUT_LANGS = [
   { code: 'AUTO', label: 'Auto-detect (Whisper)' },
   { code: 'en-US', label: 'English (United States)' },
@@ -23,26 +16,20 @@ const INPUT_LANGS = [
   { code: 'vi-VN', label: 'Vietnamese (Vietnam)' },
 ];
 
-/**
- * Client-side “coalescer” for preview only:
- * - If a new line is very short and arrives soon after the previous one,
- *   merge it into the previous sentence so you don’t see lonely words like “over”.
- */
-const MERGE_MS  = 1500; // how close in time to merge fragments
-const MERGE_LEN = 8;    // very short = merge into previous
+// ----- Mic/stream tuning -----
+const CHUNK_MS   = 1500; // ~1.5s chunks helps sentence-ish grouping
+const MIN_SEND_B = 6000; // drop very small blobs (prevents 400s)
 
 export default function Operator() {
-  const [code, setCode] = useState<string | null>(null);
+  const [code, setCode] = useState(null);
   const [inputLang, setInputLang] = useState('AUTO');
   const [langsCsv, setLangsCsv] = useState('es,vi,zh');
   const [running, setRunning] = useState(false);
-
-  // live preview lines (already coalesced for nicer reading)
-  const [log, setLog] = useState<any[]>([]);
+  const [log, setLog] = useState([]); // plain JS array; no TS syntax
 
   // media + recorder refs
-  const mediaRef = useRef<MediaStream | null>(null);
-  const recRef   = useRef<MediaRecorder | null>(null);
+  const mediaRef = useRef(null);
+  const recRef = useRef(null);
 
   const origin =
     typeof window !== 'undefined' ? window.location.origin : 'https://onevoice.church';
@@ -51,7 +38,7 @@ export default function Operator() {
     ? `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(listenerUrl)}`
     : '';
 
-  // ---- load saved prefs
+  // Load saved prefs
   useEffect(() => {
     if (typeof window === 'undefined') return;
     setCode(
@@ -62,7 +49,7 @@ export default function Operator() {
     setLangsCsv(localStorage.getItem('ov:langs') || 'es,vi,zh');
   }, []);
 
-  // ---- persist prefs
+  // Save prefs
   useEffect(() => {
     if (typeof window === 'undefined') return;
     if (code) localStorage.setItem('ov:lastCode', code);
@@ -70,47 +57,16 @@ export default function Operator() {
     localStorage.setItem('ov:langs', langsCsv);
   }, [code, inputLang, langsCsv]);
 
-  // ---- SSE live preview (with coalescing)
+  // Live preview via SSE
   useEffect(() => {
     if (!code) return;
     const es = new EventSource(`/api/stream?code=${encodeURIComponent(code)}`);
-
     es.onmessage = (e) => {
       try {
-        const line = JSON.parse(e.data); // { ts, en, tx: { es: "...", ... } }
-
-        setLog((prev) => {
-          if (!prev.length) return [line];
-
-          const prevLine = prev[prev.length - 1];
-          const short    = (line.en || '').trim().length < MERGE_LEN;
-          const close    = line.ts - prevLine.ts < MERGE_MS;
-
-          if (short && close) {
-            // merge into previous
-            const merged = { ...prevLine };
-            merged.en = `${(prevLine.en || '').trim()} ${(line.en || '').trim()}`.trim();
-
-            const allLangs = new Set([
-              ...Object.keys(prevLine.tx || {}),
-              ...Object.keys(line.tx || {}),
-            ]);
-            merged.tx = {};
-            for (const k of allLangs) {
-              const a = (prevLine.tx?.[k] || '').trim();
-              const b = (line.tx?.[k] || '').trim();
-              merged.tx[k] = [a, b].filter(Boolean).join(' ');
-            }
-            merged.ts = line.ts; // extend timestamp to last piece
-
-            return [...prev.slice(0, -1), merged];
-          }
-
-          return [...prev, line].slice(-250);
-        });
+        const line = JSON.parse(e.data);
+        setLog((prev) => [...prev, line].slice(-200));
       } catch {}
     };
-
     es.addEventListener('end', () => es.close());
     return () => es.close();
   }, [code]);
@@ -135,12 +91,17 @@ export default function Operator() {
     });
     mediaRef.current = stream;
 
-    const rec = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+    // Prefer opus-in-webm; fall back if the browser picks a default
+    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : 'audio/webm';
+
+    const rec = new MediaRecorder(stream, { mimeType: mime });
     recRef.current = rec;
 
     rec.ondataavailable = async (e) => {
       if (!e.data) return;
-      if (e.data.size < MIN_SEND_B) return; // drop tiny blobs
+      if (e.data.size < MIN_SEND_B) return; // ignore micro blobs
 
       try {
         const qs = new URLSearchParams({
@@ -164,7 +125,9 @@ export default function Operator() {
   }
 
   function stopMic() {
-    try { recRef.current && recRef.current.state !== 'inactive' && recRef.current.stop(); } catch {}
+    try {
+      if (recRef.current && recRef.current.state !== 'inactive') recRef.current.stop();
+    } catch {}
     if (mediaRef.current) {
       mediaRef.current.getTracks().forEach((t) => t.stop());
       mediaRef.current = null;
@@ -178,24 +141,16 @@ export default function Operator() {
     <main style={{ minHeight: '100vh', padding: 24, color: 'white', background: 'linear-gradient(135deg,#0e1a2b,#153a74 60%,#0f3070)' }}>
       <div style={{ maxWidth: 960, margin: '0 auto' }}>
         <h1>🎚️ Operator Console (Whisper)</h1>
-        <p style={{ opacity: 0.9 }}>
-          Share the code/QR. Set input language (or Auto). Choose target languages (csv). Start the mic.
-        </p>
+        <p style={{ opacity: 0.9 }}>Share the code/QR. Set input language (or Auto). Choose target languages (csv). Start the mic.</p>
 
         {code && (
           <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 16, alignItems: 'center' }}>
             <div>
               <div style={{ marginBottom: 6 }}>Access Code</div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                <code style={{ background: 'rgba(255,255,255,0.15)', padding: '6px 10px', borderRadius: 8, fontSize: 20 }}>
-                  {code}
-                </code>
-                <button onClick={newSession} style={{ padding: '8px 12px', border: 'none', borderRadius: 8, fontWeight: 700, cursor: 'pointer' }}>
-                  New Session
-                </button>
-                <a href={listenerUrl} target="_blank" rel="noreferrer" style={{ color: 'white', textDecoration: 'underline' }}>
-                  Open Listener
-                </a>
+                <code style={{ background: 'rgba(255,255,255,0.15)', padding: '6px 10px', borderRadius: 8, fontSize: 20 }}>{code}</code>
+                <button onClick={newSession} style={{ padding: '8px 12px', border: 'none', borderRadius: 8, fontWeight: 700, cursor: 'pointer' }}>New Session</button>
+                <a href={listenerUrl} target="_blank" rel="noreferrer" style={{ color: 'white', textDecoration: 'underline' }}>Open Listener</a>
               </div>
             </div>
             <div style={{ justifySelf: 'end' }}>
@@ -242,7 +197,7 @@ export default function Operator() {
         <h3 style={{ marginTop: 18 }}>Live Preview</h3>
         <div style={{ background: '#0b1220', color: 'white', padding: 12, borderRadius: 8, minHeight: 180, lineHeight: 1.6 }}>
           {log.map((l) => (
-            <div key={l.ts + Math.random()} style={{ marginBottom: 8 }}>
+            <div key={l.ts + Math.random()} style={{ marginBottom: 10 }}>
               <div style={{ opacity: 0.6, fontSize: 12 }}>{new Date(l.ts).toLocaleTimeString()}</div>
               <div>🗣️ {l.en}</div>
               <div>🌍 {l.tx?.[firstLang]}</div>
