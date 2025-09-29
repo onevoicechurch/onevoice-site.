@@ -8,13 +8,10 @@ export async function POST() {
 }
 
 export async function DELETE(req) {
-  const searchParams = new URL(req.url).searchParams;
-  const code = searchParams.get("code") || "";
-
+  const code = new URL(req.url).searchParams.get("code") || "";
   if (!code || !getSession(code)) {
     return NextResponse.json({ ok: false, error: "No such session" }, { status: 404 });
   }
-
   endSession(code);
   return NextResponse.json({ ok: true });
 }
