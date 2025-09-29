@@ -1,146 +1,138 @@
 // /app/api/ingest/route.js
-// Ingest mic chunks from the Operator, transcribe with OpenAI,
-// translate to target languages, and broadcast to listeners.
+// Receives mic chunks, transcribes (4o-mini-transcribe → fallback whisper-1),
+// translates, then broadcasts lines via the in-memory session store.
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-import { NextResponse } from "next/server";
-import { addLine, getSession } from "../../_lib/sessionStore"; // <- path from /app/api/ingest/
+import { NextResponse } from 'next/server';
+// NOTE: path is from /app/api/ingest to /app/_lib/sessionStore.js
+import { addLine, getSession } from '../../_lib/sessionStore';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const MIN_BYTES = 8000; // ignore tiny or corrupt blobs
 
-// --- small guards / tuning ---
-const MIN_BYTES = 1200; // drop tiny chunks to avoid spam & cost
+async function transcribeWith(model, ab, contentType, hintLang) {
+  const ext =
+    contentType?.includes('wav') ? 'wav' :
+    contentType?.includes('mp3') ? 'mp3' :
+    contentType?.includes('ogg') ? 'ogg' :
+    contentType?.includes('m4a') ? 'm4a' :
+    'webm';
 
-// Helpers
-function diag(code, text, targets = []) {
-  addLine(code, {
-    ts: Date.now(),
-    en: text,
-    tx: Object.fromEntries(targets.map((t) => [t, ""])),
-  });
-}
-
-async function transcribeWith(model, ab, contentType, inputLang) {
-  const fd = new FormData();
-  // most browsers send audio/webm;codecs=opus; give the file a .webm name
-  fd.append("file", new Blob([ab], { type: contentType }), "clip.webm");
-  fd.append("model", model);
-  if (inputLang && inputLang !== "AUTO") {
-    // hint language (faster/cheaper than autodetect)
-    fd.append("language", inputLang.split("-")[0]); // "en-US" -> "en"
+  const form = new FormData();
+  form.append('file', new Blob([ab], { type: contentType || 'audio/webm' }), `clip.${ext}`);
+  form.append('model', model);
+  if (hintLang && hintLang !== 'AUTO') {
+    form.append('language', hintLang.split('-')[0]); // “en-US” → “en”
   }
 
-  const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
+  const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: fd,
+    body: form,
   });
-
-  if (!r.ok) {
-    const txt = await r.text().catch(() => "");
-    const err = new Error(`transcribe ${model} failed ${r.status}`);
-    err.status = r.status;
-    err.detail = txt;
-    throw err;
-  }
-
-  const j = await r.json();
-  return (j?.text || "").trim();
+  return r;
 }
 
-async function translateOne(text, target) {
-  const prompt = `Translate the following text into ${target}. Return only the translation, no quotes:\n\n${text}`;
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
+async function translateAll(text, targets) {
+  if (!targets.length) return {};
+  const body = {
+    model: 'gpt-4o-mini',
+    messages: targets.map((t) => ({
+      role: 'user',
+      content: `Translate into ${t}. Return only the translation:\n\n${text}`,
+    })),
+    temperature: 0.2,
+  };
+  const r = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
+      'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.2,
-    }),
+    body: JSON.stringify(body),
   });
 
-  if (!r.ok) return "";
-  const j = await r.json();
-  return (j?.choices?.[0]?.message?.content || "").trim();
+  if (!r.ok) return Object.fromEntries(targets.map((t) => [t, '']));
+  const j = await r.json().catch(() => ({}));
+  // One message per target in order
+  const out = {};
+  targets.forEach((t, i) => {
+    out[t] = (j?.choices?.[i]?.message?.content || '').trim();
+  });
+  return out;
 }
 
 export async function POST(req) {
   try {
-    // --- query params ---
+    if (!OPENAI_API_KEY) {
+      return NextResponse.json({ ok: false, error: 'Missing OPENAI_API_KEY' }, { status: 500 });
+    }
+
     const url = new URL(req.url);
-    const code = url.searchParams.get("code") || "";
-    const inputLang = url.searchParams.get("inputLang") || "AUTO";
-    const langsCsv = url.searchParams.get("langs") || "es";
-    const targets = langsCsv
-      .split(",")
+    const code = url.searchParams.get('code') || '';
+    const inputLang = url.searchParams.get('inputLang') || 'AUTO';
+    const targets = (url.searchParams.get('langs') || 'es')
+      .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
 
-    // --- session & env checks ---
-    if (!code || !getSession(code)) {
-      return NextResponse.json({ ok: false, error: "No such session" }, { status: 404 });
-    }
-    if (!OPENAI_API_KEY) {
-      diag(code, "⚠️ Missing OPENAI_API_KEY env var");
-      return NextResponse.json({ ok: false, error: "missing_api_key" }, { status: 500 });
+    const session = getSession(code);
+    if (!session) {
+      return NextResponse.json({ ok: false, error: 'No such session' }, { status: 404 });
     }
 
-    // --- read audio chunk ---
     const ab = await req.arrayBuffer();
     const bytes = ab.byteLength || 0;
-    const contentType = req.headers.get("content-type") || "audio/webm;codecs=opus";
-
     if (bytes < MIN_BYTES) {
-      // too tiny; skip silently to reduce noise
-      return NextResponse.json({ ok: true, skipped: "tiny_chunk" });
+      return NextResponse.json({ ok: true, skipped: 'tiny_chunk' });
     }
 
-    // Optional: small diagnostic line so you can see chunks arriving
-    diag(code, `🗣️ 🎤 chunk ${bytes}B (${contentType})`, targets);
+    const contentType = req.headers.get('content-type') || 'audio/webm';
 
-    // --- transcribe (try 4o, then whisper-1) ---
-    let text = "";
-    try {
-      text = await transcribeWith("gpt-4o-transcribe", ab, contentType, inputLang);
-    } catch (e) {
-      // Show a short diagnostic
-      diag(code, `🗣️ [transcribe error ${e.status || "?"}] 4o-transcribe → trying whisper-1`, targets);
-      try {
-        text = await transcribeWith("whisper-1", ab, contentType, inputLang);
-      } catch (e2) {
-        diag(code, `🗣️ [transcribe error ${e2.status || "?"}]`, targets);
-        return NextResponse.json({ ok: false, error: "transcription_failed" }, { status: 502 });
+    // Try 4o-mini-transcribe first (faster/cheaper), then fall back to whisper-1
+    let txResp = await transcribeWith('gpt-4o-mini-transcribe', ab, contentType, inputLang);
+    let usedModel = 'gpt-4o-mini-transcribe';
+
+    if (!txResp.ok) {
+      const errText = await txResp.text().catch(() => '');
+      // Some accounts/models don’t like webm/opus. Try whisper-1 next.
+      txResp = await transcribeWith('whisper-1', ab, contentType, inputLang);
+      usedModel = 'whisper-1';
+
+      if (!txResp.ok) {
+        // Still show something in the console so you can see errors live
+        addLine(code, {
+          ts: Date.now(),
+          en: `[transcribe error ${txResp.status}]`,
+          tx: Object.fromEntries(targets.map((t) => [t, ''])),
+        });
+        return NextResponse.json(
+          { ok: false, error: 'transcription_failed', detail: errText || (await txResp.text().catch(() => '')) },
+          { status: 502 }
+        );
       }
     }
 
-    if (!text) {
-      // empty or silence
-      return NextResponse.json({ ok: true, empty: true });
+    const txJson = await txResp.json().catch(() => ({}));
+    const englishText = (txJson?.text || '').trim();
+
+    if (!englishText) {
+      return NextResponse.json({ ok: true, empty: true, model: usedModel });
     }
 
-    // --- translate in parallel ---
-    const translations = Object.fromEntries(
-      await Promise.all(
-        targets.map(async (t) => [t, await translateOne(text, t)])
-      )
-    );
+    const translations = await translateAll(englishText, targets);
 
-    // --- broadcast line to listeners and preview ---
     addLine(code, {
       ts: Date.now(),
-      en: text,
+      en: englishText,
       tx: translations,
     });
 
-    return NextResponse.json({ ok: true });
+    return NextResponse.json({ ok: true, model: usedModel });
   } catch (err) {
-    console.error("ingest fatal error", err);
-    return NextResponse.json({ ok: false, error: "server_error" }, { status: 500 });
+    console.error('ingest fatal error', err);
+    return NextResponse.json({ ok: false, error: 'server_error' }, { status: 500 });
   }
 }
