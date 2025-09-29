@@ -1,4 +1,4 @@
-'use client';
+'use client'; // must be FIRST line
 
 import { useEffect, useRef, useState } from 'react';
 
@@ -14,10 +14,10 @@ const INPUT_LANGS = [
   { code: 'vi-VN', label: 'Vietnamese (Vietnam)' },
 ];
 
-// ====== TUNING (balanced defaults) ======
-const CHUNK_MS    = 1200;  // ~1.2s mic chunks
-const MIN_SEND_B  = 4000;  // ignore blobs smaller than this
-// =======================================
+// ====== TUNING (balanced defaults) — single source of truth ======
+const CHUNK_MS   = 1500; // ~1.5s mic chunks for bigger, cleaner uploads
+const MIN_SEND_B = 6000; // ignore blobs smaller than this to avoid 400s
+// =================================================================
 
 export default function Operator() {
   const [code, setCode] = useState(null);
@@ -29,8 +29,7 @@ export default function Operator() {
   const mediaRef = useRef(null);
   const recRef = useRef(null);
 
-  const origin =
-    typeof window !== 'undefined' ? window.location.origin : 'https://onevoice.church';
+  const origin = typeof window !== 'undefined' ? window.location.origin : 'https://onevoice.church';
   const listenerUrl = code ? `${origin}/s/${encodeURIComponent(code)}` : '#';
   const qrUrl = code
     ? `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(listenerUrl)}`
@@ -39,10 +38,7 @@ export default function Operator() {
   // load prefs
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    setCode(
-      localStorage.getItem('ov:lastCode') ||
-        Math.random().toString(36).slice(2, 6).toUpperCase()
-    );
+    setCode(localStorage.getItem('ov:lastCode') || Math.random().toString(36).slice(2, 6).toUpperCase());
     setInputLang(localStorage.getItem('ov:inputLang') || 'AUTO');
     setLangsCsv(localStorage.getItem('ov:langs') || 'es,vi,zh');
   }, []);
@@ -94,7 +90,7 @@ export default function Operator() {
 
     rec.ondataavailable = async (e) => {
       if (!e.data) return;
-      if (e.data.size < MIN_SEND_B) return; // drop tiny chunks to avoid 400s
+      if (e.data.size < MIN_SEND_B) return; // drop tiny chunks → avoids 400s
 
       try {
         const qs = new URLSearchParams({
@@ -113,7 +109,7 @@ export default function Operator() {
       }
     };
 
-    rec.start(CHUNK_MS);
+    rec.start(CHUNK_MS); // send ~1.5s chunks
     setRunning(true);
   }
 
