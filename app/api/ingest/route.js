@@ -1,15 +1,13 @@
-// /app/api/ingest/route.js
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
-import { addLine, getSession } from "@/app/api/_lib/sessionStore";
+import { addLine, getSession } from "../_lib/sessionStore";
 
-const MIN_BYTES = 3500; // drop tiny blobs
+const MIN_BYTES = 3500;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// --- Whisper-only transcription ---
-async function transcribe(ab, contentType, inputLang) {
+async function transcribeWithFallback(ab, contentType, inputLang) {
   const ext =
     contentType?.includes("wav") ? "wav" :
     contentType?.includes("mp3") ? "mp3" :
@@ -18,29 +16,52 @@ async function transcribe(ab, contentType, inputLang) {
 
   const file = new Blob([ab], { type: contentType || "audio/webm" });
 
-  const fd = new FormData();
-  fd.append("file", file, `clip.${ext}`);
-  fd.append("model", "whisper-1");
+  // Try gpt-4o-mini-transcribe first
+  {
+    const fd = new FormData();
+    fd.append("file", file, `clip.${ext}`);
+    fd.append("model", "gpt-4o-mini-transcribe");
+    if (inputLang && inputLang !== "AUTO") {
+      const primary = inputLang.split("-")[0];
+      fd.append("language", primary);
+    }
+
+    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+      body: fd,
+    });
+
+    if (r.ok) return (await r.json())?.text?.trim() || "";
+
+    if (r.status !== 400) {
+      const t = await r.text().catch(() => "");
+      throw new Error(`transcribe failed (${r.status}): ${t}`);
+    }
+  }
+
+  // Fallback: whisper-1
+  const fd2 = new FormData();
+  fd2.append("file", file, `clip.${ext}`);
+  fd2.append("model", "whisper-1");
   if (inputLang && inputLang !== "AUTO") {
     const primary = inputLang.split("-")[0];
-    fd.append("language", primary);
+    fd2.append("language", primary);
   }
 
-  const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+  const r2 = await fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: fd,
+    body: fd2,
   });
 
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`whisper-1 failed (${r.status}): ${t}`);
+  if (!r2.ok) {
+    const t = await r2.text().catch(() => "");
+    throw new Error(`whisper-1 failed (${r2.status}): ${t}`);
   }
-
-  return (await r.json())?.text?.trim() || "";
+  return (await r2.json())?.text?.trim() || "";
 }
 
-// --- Translate with GPT ---
 async function translateAll(englishText, targets) {
   const results = await Promise.all(
     targets.map(async (lang) => {
@@ -65,7 +86,6 @@ async function translateAll(englishText, targets) {
   return Object.fromEntries(results);
 }
 
-// --- Main POST handler ---
 export async function POST(req) {
   try {
     const url = new URL(req.url);
@@ -74,7 +94,6 @@ export async function POST(req) {
     const langsCsv = url.searchParams.get("langs") || "es";
     const targetLangs = langsCsv.split(",").map((s) => s.trim()).filter(Boolean);
 
-    // Validate session & key
     const session = getSession(code);
     if (!code || !session) {
       return NextResponse.json({ ok: false, error: "No such session" }, { status: 404 });
@@ -83,7 +102,6 @@ export async function POST(req) {
       return NextResponse.json({ ok: false, error: "Missing OPENAI_API_KEY" }, { status: 500 });
     }
 
-    // Read audio
     const ab = await req.arrayBuffer();
     const bytes = ab.byteLength || 0;
     if (bytes < MIN_BYTES) {
@@ -91,10 +109,9 @@ export async function POST(req) {
     }
     const contentType = req.headers.get("content-type") || "audio/webm";
 
-    // Transcribe
     let englishText = "";
     try {
-      englishText = await transcribe(ab, contentType, inputLang);
+      englishText = await transcribeWithFallback(ab, contentType, inputLang);
     } catch (e) {
       addLine(code, {
         ts: Date.now(),
@@ -108,10 +125,8 @@ export async function POST(req) {
       return NextResponse.json({ ok: true, empty: true });
     }
 
-    // Translate
     const translations = await translateAll(englishText, targetLangs);
 
-    // Broadcast
     addLine(code, { ts: Date.now(), en: englishText, tx: translations });
 
     return NextResponse.json({ ok: true });
