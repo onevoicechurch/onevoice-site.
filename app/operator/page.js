@@ -12,7 +12,7 @@ const INPUT_LANGS = [
   { code: 'es-ES', label: 'Spanish (Spain)' },
   { code: 'es-MX', label: 'Spanish (Mexico)' },
   { code: 'vi-VN', label: 'Vietnamese (Vietnam)' },
-];
+};
 
 // ====== TUNING (balanced defaults) ======
 const CHUNK_MS = 5000;          // ~5s chunks for smoother sentences
@@ -96,10 +96,12 @@ export default function Operator() {
 
   // ===== microphone & upload (chunked) =====
   async function startMic() {
+    // Prefer OGG/Opus (accepted by API); fall back as needed per browser
     const preferred = [
-      'audio/webm;codecs=opus',
-      'audio/webm',
-      'audio/mp4', // iOS fallback
+      'audio/ogg;codecs=opus',     // ✅ best for OpenAI + Chrome/Firefox
+      'audio/webm;codecs=opus',    // fallback if OGG unsupported
+      'audio/mp4',                 // ✅ Safari/iOS
+      'audio/webm',                // last resort
     ];
     let mimeType = '';
     for (const t of preferred) {
@@ -135,7 +137,7 @@ export default function Operator() {
 
         await fetch('/api/ingest?' + qs.toString(), {
           method: 'POST',
-          headers: { 'Content-Type': e.data.type || mimeType || 'audio/webm' },
+          headers: { 'Content-Type': e.data.type || mimeType || 'audio/ogg' },
           body: await e.data.arrayBuffer(),
         });
       } catch (err) {
@@ -286,7 +288,6 @@ export default function Operator() {
                 background: '#ff5555',
                 color: 'white',
                 fontWeight: 700,
-                cursor: 'pointer',
               }}
             >
               ⏹️ Mic OFF
