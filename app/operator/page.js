@@ -14,11 +14,10 @@ const INPUT_LANGS = [
   { code: 'vi-VN', label: 'Vietnamese (Vietnam)' },
 ];
 
-// ====== TUNING SETTINGS ======
-const PAUSE_MS = 900;       // how long of silence ends an utterance
-const MAX_UTTER_MS = 8000;  // flush if speaking longer than this
-const MIN_BLOB_BYTES = 8000; // ignore tiny blobs (invalid audio)
-// ==============================
+// ====== TUNING (balanced defaults) ======
+const CHUNK_MS = 5000;          // ~5s chunks for smoother sentences
+const MIN_BLOB_BYTES = 5000;    // ignore tiny blobs client-side
+// ========================================
 
 export default function Operator() {
   const [code, setCode] = useState(null);
@@ -29,7 +28,6 @@ export default function Operator() {
 
   const mediaRef = useRef(null);
   const recRef = useRef(null);
-  const lastSendRef = useRef(0);
 
   const siteOrigin =
     typeof window !== 'undefined'
@@ -96,7 +94,7 @@ export default function Operator() {
     setLog([]);
   }
 
-  // ========== MIC HANDLING ==========
+  // ===== microphone & upload (chunked) =====
   async function startMic() {
     const preferred = [
       'audio/webm;codecs=opus',
@@ -128,45 +126,34 @@ export default function Operator() {
     rec.ondataavailable = async (e) => {
       if (!e.data || e.data.size < MIN_BLOB_BYTES) return;
 
-      const now = Date.now();
-      const elapsed = now - lastSendRef.current;
+      try {
+        const qs = new URLSearchParams({
+          code: code || '',
+          inputLang: inputLang || 'AUTO',
+          langs: (langsCsv || 'es').replace(/\s+/g, ''),
+        });
 
-      // Send only when long enough OR paused long enough
-      if (elapsed > MAX_UTTER_MS || e.data.size > 20000) {
-        lastSendRef.current = now;
-        try {
-          const qs = new URLSearchParams({
-            code: code || '',
-            inputLang: inputLang || 'AUTO',
-            langs: (langsCsv || 'es').replace(/\s+/g, ''),
-          });
-
-          await fetch('/api/ingest?' + qs.toString(), {
-            method: 'POST',
-            headers: { 'Content-Type': e.data.type || mimeType || 'audio/webm' },
-            body: await e.data.arrayBuffer(),
-          });
-        } catch (err) {
-          console.error('ingest error', err);
-        }
+        await fetch('/api/ingest?' + qs.toString(), {
+          method: 'POST',
+          headers: { 'Content-Type': e.data.type || mimeType || 'audio/webm' },
+          body: await e.data.arrayBuffer(),
+        });
+      } catch (err) {
+        console.error('ingest error', err);
       }
     };
 
-    // collect bigger chunks (~8s) to mimic full sentences
-    rec.start(8000);
+    // ~5s slices → fewer fragments, still responsive
+    rec.start(CHUNK_MS);
     setRunning(true);
   }
 
   function stopMic() {
-    try {
-      recRef.current?.stop();
-    } catch {/* noop */}
-    try {
-      mediaRef.current?.getTracks().forEach((t) => t.stop());
-    } catch {/* noop */}
+    try { recRef.current?.stop(); } catch {}
+    try { mediaRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
     setRunning(false);
   }
-  // ==================================
+  // ========================================
 
   return (
     <main
