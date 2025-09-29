@@ -1,90 +1,76 @@
 // /app/api/ingest/route.js
+// Receives mic audio, transcribes (4o-mini-transcribe → fallback whisper-1),
+// translates, and broadcasts to listeners.
+
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 import { NextResponse } from 'next/server';
-// ✅ use a relative path (one folder up from /ingest to /api, then _lib/sessionStore.js)
-import { addLine, getSession } from '../_lib/sessionStore';
+import OpenAI, { toFile } from 'openai';
+import { addLine, getSession } from '../_lib/sessionStore'; // <-- relative path (one level up)
 
-const MIN_BYTES = 3500; // drop tiny blobs
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// Try 4o-mini-transcribe first, fall back to whisper-1 if the API says format/corruption.
-async function transcribeWithFallback(ab, contentType, inputLang) {
-  const ext =
-    contentType?.includes('wav') ? 'wav' :
-    contentType?.includes('mp3') ? 'mp3' :
-    contentType?.includes('ogg') ? 'ogg' :
-    contentType?.includes('m4a') ? 'm4a' : 'webm';
+// drop tiny blobs (they often cause “invalid/corrupt” and cost money)
+const MIN_BYTES = 3500;
 
-  const file = new Blob([ab], { type: contentType || 'audio/webm' });
-
-  // 1) 4o-mini-transcribe
-  {
-    const fd = new FormData();
-    fd.append('file', file, `clip.${ext}`);
-    fd.append('model', 'gpt-4o-mini-transcribe');
-    if (inputLang && inputLang !== 'AUTO') {
-      const primary = inputLang.split('-')[0];
-      fd.append('language', primary);
-    }
-
-    const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: fd,
-    });
-
-    if (r.ok) return (await r.json())?.text?.trim() || '';
-
-    // If it looks like a format/corruption 400, try whisper-1 next
-    if (r.status !== 400) {
-      const t = await r.text().catch(() => '');
-      throw new Error(`transcribe failed (${r.status}): ${t}`);
-    }
-  }
-
-  // 2) whisper-1
-  const fd2 = new FormData();
-  fd2.append('file', file, `clip.${ext}`);
-  fd2.append('model', 'whisper-1');
-  if (inputLang && inputLang !== 'AUTO') {
-    const primary = inputLang.split('-')[0];
-    fd2.append('language', primary);
-  }
-
-  const r2 = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: fd2,
-  });
-
-  if (!r2.ok) {
-    const t = await r2.text().catch(() => '');
-    throw new Error(`whisper-1 failed (${r2.status}): ${t}`);
-  }
-  return (await r2.json())?.text?.trim() || '';
+function langHint(inputLang) {
+  if (!inputLang || inputLang.toUpperCase() === 'AUTO') return undefined;
+  return inputLang.split('-')[0]; // "en-US" -> "en"
 }
 
-async function translateAll(englishText, targets) {
+function pickExt(contentType = '') {
+  const ct = contentType.toLowerCase();
+  if (ct.includes('wav')) return 'wav';
+  if (ct.includes('mp3') || ct.includes('mpga') || ct.includes('mpeg')) return 'mp3';
+  if (ct.includes('m4a')) return 'm4a';
+  if (ct.includes('ogg') || ct.includes('oga')) return 'ogg';
+  if (ct.includes('mp4')) return 'mp4';
+  if (ct.includes('webm')) return 'webm';
+  return 'webm';
+}
+
+async function transcribeWithSDK(file, language) {
+  // 1) try 4o-mini-transcribe
+  try {
+    const r1 = await openai.audio.transcriptions.create({
+      model: 'gpt-4o-mini-transcribe',
+      file,
+      ...(language ? { language } : {}),
+    });
+    const text = (r1?.text || '').trim();
+    if (text) return text;
+  } catch (e) {
+    // fall through to whisper-1
+  }
+
+  // 2) whisper-1 (more tolerant)
+  const r2 = await openai.audio.transcriptions.create({
+    model: 'whisper-1',
+    file,
+    ...(language ? { language } : {}),
+  });
+  return (r2?.text || '').trim();
+}
+
+async function translateAll(text, targets) {
+  if (!targets.length) return {};
   const results = await Promise.all(
     targets.map(async (lang) => {
-      const prompt = `Translate the following into ${lang}. Return only the translation:\n\n${englishText}`;
-      const r = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
+      try {
+        const r = await openai.chat.completions.create({
           model: 'gpt-4o-mini',
           temperature: 0.2,
-          messages: [{ role: 'user', content: prompt }],
-        }),
-      });
-      if (!r.ok) return [lang, ''];
-      const j = await r.json();
-      return [lang, (j?.choices?.[0]?.message?.content || '').trim()];
+          messages: [
+            { role: 'system', content: `Translate to ${lang}. Return only the translation.` },
+            { role: 'user', content: text },
+          ],
+        });
+        return [lang, (r?.choices?.[0]?.message?.content || '').trim()];
+      } catch {
+        return [lang, ''];
+      }
     })
   );
   return Object.fromEntries(results);
@@ -92,53 +78,58 @@ async function translateAll(englishText, targets) {
 
 export async function POST(req) {
   try {
-    const url = new URL(req.url);
-    const code = url.searchParams.get('code') || '';
-    const inputLang = url.searchParams.get('inputLang') || 'AUTO';
-    const langsCsv = url.searchParams.get('langs') || 'es';
-    const targetLangs = langsCsv.split(',').map((s) => s.trim()).filter(Boolean);
-
-    // Validate session & key
-    const session = getSession(code);
-    if (!code || !session) {
-      return NextResponse.json({ ok: false, error: 'No such session' }, { status: 404 });
-    }
     if (!OPENAI_API_KEY) {
       return NextResponse.json({ ok: false, error: 'Missing OPENAI_API_KEY' }, { status: 500 });
     }
 
-    // Read audio
+    const url = new URL(req.url);
+    const code = url.searchParams.get('code') || '';
+    const inputLang = url.searchParams.get('inputLang') || 'AUTO';
+    const langsCsv = url.searchParams.get('langs') || 'es';
+    const targets = langsCsv.split(',').map(s => s.trim()).filter(Boolean);
+
+    const session = getSession(code);
+    if (!code || !session) {
+      return NextResponse.json({ ok: false, error: 'No such session' }, { status: 404 });
+    }
+
     const ab = await req.arrayBuffer();
     const bytes = ab.byteLength || 0;
     if (bytes < MIN_BYTES) {
-      // too tiny -> drop quietly to avoid noisy 400s
       return NextResponse.json({ ok: true, skipped: 'tiny' });
     }
-    const contentType = req.headers.get('content-type') || 'audio/webm';
 
-    // Transcribe (with fallback)
+    const contentType = req.headers.get('content-type') || 'audio/webm';
+    const ext = pickExt(contentType);
+    const language = langHint(inputLang);
+
+    // IMPORTANT: build a real File with a filename so OpenAI knows the format
+    const blob = new Blob([ab], { type: contentType });
+    const file = await toFile(blob, `clip.${ext}`);
+
+    // transcribe with SDK (auto-fallback)
     let englishText = '';
     try {
-      englishText = await transcribeWithFallback(ab, contentType, inputLang);
+      englishText = await transcribeWithSDK(file, language);
     } catch (e) {
-      // Tell the operator what happened
+      // show a one-line diagnostic in Operator UI
       addLine(code, {
         ts: Date.now(),
-        en: `[transcribe error] ${(e?.message || '').slice(0, 180)}`,
-        tx: Object.fromEntries(targetLangs.map((l) => [l, ''])),
+        en: `[transcribe error] ${(e?.message || '').slice(0, 160)}`,
+        tx: Object.fromEntries(targets.map(t => [t, ''])),
       });
       return NextResponse.json({ ok: false, error: 'transcription_failed' }, { status: 502 });
     }
 
     if (!englishText) {
-      // silence/no speech
+      // nothing recognized (silence/noise)
       return NextResponse.json({ ok: true, empty: true });
     }
 
-    // Translate
-    const translations = await translateAll(englishText, targetLangs);
+    // translate in parallel
+    const translations = await translateAll(englishText, targets);
 
-    // Broadcast
+    // broadcast to listeners
     addLine(code, { ts: Date.now(), en: englishText, tx: translations });
 
     return NextResponse.json({ ok: true });
