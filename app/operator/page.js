@@ -1,9 +1,7 @@
-// /app/operator/page.js
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
 
-// ----- UI language choices -----
 const INPUT_LANGS = [
   { code: 'AUTO', label: 'Auto-detect (Whisper)' },
   { code: 'en-US', label: 'English (United States)' },
@@ -16,40 +14,33 @@ const INPUT_LANGS = [
   { code: 'vi-VN', label: 'Vietnamese (Vietnam)' },
 ];
 
-// ----- Mic/stream tuning -----
-const CHUNK_MS   = 1500; // ~1.5s chunks helps sentence-ish grouping
-const MIN_SEND_B = 6000; // drop very small blobs (prevents 400s)
+// Mic → send ~1.5s chunks, ignore tiny blobs
+const CHUNK_MS   = 1500;
+const MIN_SEND_B = 6000;
 
 export default function Operator() {
   const [code, setCode] = useState(null);
   const [inputLang, setInputLang] = useState('AUTO');
   const [langsCsv, setLangsCsv] = useState('es,vi,zh');
   const [running, setRunning] = useState(false);
-  const [log, setLog] = useState([]); // plain JS array; no TS syntax
+  const [log, setLog] = useState([]);
 
-  // media + recorder refs
   const mediaRef = useRef(null);
   const recRef = useRef(null);
 
-  const origin =
-    typeof window !== 'undefined' ? window.location.origin : 'https://onevoice.church';
+  const origin = typeof window !== 'undefined' ? window.location.origin : 'https://onevoice.church';
   const listenerUrl = code ? `${origin}/s/${encodeURIComponent(code)}` : '#';
   const qrUrl = code
-    ? `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(listenerUrl)}`
+    ? `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(listenerUrl)}`
     : '';
 
-  // Load saved prefs
+  // prefs
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    setCode(
-      localStorage.getItem('ov:lastCode') ||
-        Math.random().toString(36).slice(2, 6).toUpperCase()
-    );
+    setCode(localStorage.getItem('ov:lastCode') || Math.random().toString(36).slice(2, 6).toUpperCase());
     setInputLang(localStorage.getItem('ov:inputLang') || 'AUTO');
     setLangsCsv(localStorage.getItem('ov:langs') || 'es,vi,zh');
   }, []);
-
-  // Save prefs
   useEffect(() => {
     if (typeof window === 'undefined') return;
     if (code) localStorage.setItem('ov:lastCode', code);
@@ -57,7 +48,7 @@ export default function Operator() {
     localStorage.setItem('ov:langs', langsCsv);
   }, [code, inputLang, langsCsv]);
 
-  // Live preview via SSE
+  // live preview (SSE)
   useEffect(() => {
     if (!code) return;
     const es = new EventSource(`/api/stream?code=${encodeURIComponent(code)}`);
@@ -91,17 +82,11 @@ export default function Operator() {
     });
     mediaRef.current = stream;
 
-    // Prefer opus-in-webm; fall back if the browser picks a default
-    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-      ? 'audio/webm;codecs=opus'
-      : 'audio/webm';
-
-    const rec = new MediaRecorder(stream, { mimeType: mime });
+    const rec = new MediaRecorder(stream, { mimeType: 'audio/webm' });
     recRef.current = rec;
 
     rec.ondataavailable = async (e) => {
-      if (!e.data) return;
-      if (e.data.size < MIN_SEND_B) return; // ignore micro blobs
+      if (!e.data || e.data.size < MIN_SEND_B) return;
 
       try {
         const qs = new URLSearchParams({
@@ -112,7 +97,7 @@ export default function Operator() {
         const ab = await e.data.arrayBuffer();
         await fetch('/api/ingest?' + qs.toString(), {
           method: 'POST',
-          headers: { 'Content-Type': e.data.type || 'audio/webm' },
+          headers: { 'Content-Type': 'audio/webm' }, // normalize header
           body: ab,
         });
       } catch (err) {
@@ -125,9 +110,7 @@ export default function Operator() {
   }
 
   function stopMic() {
-    try {
-      if (recRef.current && recRef.current.state !== 'inactive') recRef.current.stop();
-    } catch {}
+    try { recRef.current && recRef.current.state !== 'inactive' && recRef.current.stop(); } catch {}
     if (mediaRef.current) {
       mediaRef.current.getTracks().forEach((t) => t.stop());
       mediaRef.current = null;
@@ -197,7 +180,7 @@ export default function Operator() {
         <h3 style={{ marginTop: 18 }}>Live Preview</h3>
         <div style={{ background: '#0b1220', color: 'white', padding: 12, borderRadius: 8, minHeight: 180, lineHeight: 1.6 }}>
           {log.map((l) => (
-            <div key={l.ts + Math.random()} style={{ marginBottom: 10 }}>
+            <div key={`${l.ts}-${Math.random()}`} style={{ marginBottom: 10 }}>
               <div style={{ opacity: 0.6, fontSize: 12 }}>{new Date(l.ts).toLocaleTimeString()}</div>
               <div>🗣️ {l.en}</div>
               <div>🌍 {l.tx?.[firstLang]}</div>
