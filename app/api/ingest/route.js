@@ -13,12 +13,15 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const MIN_BYTES = 4500;
 
 function extFor(type) {
-  if (!type) return "webm";
-  if (type.includes("wav")) return "wav";
-  if (type.includes("mp3")) return "mp3";
+  if (!type) return "ogg";
   if (type.includes("ogg")) return "ogg";
+  if (type.includes("oga")) return "oga";
+  if (type.includes("mp3")) return "mp3";
   if (type.includes("m4a")) return "m4a";
-  return "webm";
+  if (type.includes("mp4")) return "mp4";
+  if (type.includes("wav")) return "wav";
+  if (type.includes("webm")) return "webm";
+  return "ogg";
 }
 
 async function txWith(model, ab, contentType, langHint, apiKey) {
@@ -80,7 +83,7 @@ export async function POST(req) {
 
     const ab = await req.arrayBuffer();
     const bytes = ab.byteLength || 0;
-    const contentType = req.headers.get("content-type") || "audio/webm";
+    const contentType = req.headers.get("content-type") || "audio/ogg;codecs=opus";
 
     // Debug heartbeat so you see traffic
     addLine(code, {
@@ -93,7 +96,7 @@ export async function POST(req) {
       return NextResponse.json({ ok: true, skipped: "tiny_chunk" });
     }
 
-    // Try modern first; fallback to whisper-1 if needed
+    // Prefer 4o-mini-transcribe; if not available, fallback to whisper-1
     let resp = await txWith("gpt-4o-mini-transcribe", ab, contentType, inputLang, OPENAI_API_KEY);
 
     if (!resp.ok && (resp.status === 400 || resp.status === 404)) {
