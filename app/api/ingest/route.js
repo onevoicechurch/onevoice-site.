@@ -1,4 +1,6 @@
 // /app/api/ingest/route.js
+// Receives ~5s mic chunks, transcribes (OpenAI), translates, broadcasts.
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -6,7 +8,9 @@ import { NextResponse } from "next/server";
 import { addLine, getSession } from "../_lib/sessionStore";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const MIN_BYTES = 1; // keep tiny while testing
+
+// match client threshold (slightly lower server-side)
+const MIN_BYTES = 4500;
 
 function extFor(type) {
   if (!type) return "webm";
@@ -21,7 +25,6 @@ async function txWith(model, ab, contentType, langHint, apiKey) {
   const form = new FormData();
   form.append("file", new Blob([ab], { type: contentType }), `clip.${extFor(contentType)}`);
   form.append("model", model);
-  // Only pass language when user chose a concrete input; skip for AUTO
   if (langHint && langHint !== "AUTO") {
     form.append("language", langHint.split("-")[0]); // "en-US" -> "en"
   }
@@ -32,7 +35,7 @@ async function txWith(model, ab, contentType, langHint, apiKey) {
   });
 }
 
-async function translate(englishText, targets, apiKey) {
+async function translateText(englishText, targets, apiKey) {
   if (!targets.length) return {};
   const pairs = await Promise.all(
     targets.map(async (target) => {
@@ -79,7 +82,7 @@ export async function POST(req) {
     const bytes = ab.byteLength || 0;
     const contentType = req.headers.get("content-type") || "audio/webm";
 
-    // Always show chunk debug
+    // Debug heartbeat so you see traffic
     addLine(code, {
       ts: Date.now(),
       en: `🎤 chunk ${bytes}B (${contentType})`,
@@ -90,18 +93,17 @@ export async function POST(req) {
       return NextResponse.json({ ok: true, skipped: "tiny_chunk" });
     }
 
-    // 1) Try whisper-1 first
-    let resp = await txWith("whisper-1", ab, contentType, inputLang, OPENAI_API_KEY);
+    // Try modern first; fallback to whisper-1 if needed
+    let resp = await txWith("gpt-4o-mini-transcribe", ab, contentType, inputLang, OPENAI_API_KEY);
 
-    // 2) If whisper-1 responds 400/404, try gpt-4o-mini-transcribe
     if (!resp.ok && (resp.status === 400 || resp.status === 404)) {
       const detail = (await resp.text().catch(() => ""))?.slice(0, 120);
       addLine(code, {
         ts: Date.now(),
-        en: `[transcribe error ${resp.status}] whisper-1: ${detail || "(no detail)"} → try 4o-mini-transcribe`,
+        en: `[transcribe error ${resp.status}] 4o-mini-transcribe: ${detail || "(no detail)"} → try whisper-1`,
         tx: Object.fromEntries(targetLangs.map(l => [l, ""])),
       });
-      resp = await txWith("gpt-4o-mini-transcribe", ab, contentType, inputLang, OPENAI_API_KEY);
+      resp = await txWith("whisper-1", ab, contentType, inputLang, OPENAI_API_KEY);
     }
 
     if (!resp.ok) {
@@ -116,14 +118,15 @@ export async function POST(req) {
 
     const txJson = await resp.json();
     const englishText = (txJson?.text || "").trim();
+
     if (!englishText) {
       addLine(code, { ts: Date.now(), en: "…(no speech detected)", tx: {} });
       return NextResponse.json({ ok: true, empty: true });
     }
 
-    const translations = await translate(englishText, targetLangs, OPENAI_API_KEY);
-    addLine(code, { ts: Date.now(), en: englishText, tx: translations });
+    const translations = await translateText(englishText, targetLangs, OPENAI_API_KEY);
 
+    addLine(code, { ts: Date.now(), en: englishText, tx: translations });
     return NextResponse.json({ ok: true });
   } catch (err) {
     console.error("ingest fatal error", err);
