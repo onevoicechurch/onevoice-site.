@@ -1,13 +1,8 @@
-// /app/api/stream/route.js
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+import { getSession, attachListener, detachListener } from "../_lib/sessionStore";
 
-import { getSession, attachListener, detachListener } from "@/app/api/_lib/sessionStore";
-
-// Server-Sent Events stream for live captions
 export async function GET(req) {
-  const { searchParams } = new URL(req.url);
-  const code = searchParams.get("code") || "";
+  const searchParams = new URL(req.url).searchParams;
+  const code = searchParams.get("code");
 
   const session = getSession(code);
   if (!code || !session) {
@@ -17,53 +12,26 @@ export async function GET(req) {
     });
   }
 
-  // Create an SSE Response using a ReadableStream
-  const stream = new ReadableStream({
-    start(controller) {
-      // Minimal "res-like" object that sessionStore expects
-      const res = {
-        write: (chunk) => controller.enqueue(new TextEncoder().encode(chunk)),
-        flush: () => {}, // no-op on web streams
-        end: () => controller.close(),
-      };
-
-      // Attach the listener (this also replays history)
-      const ok = attachListener(code, res);
-      if (!ok) {
-        controller.error(new Error("attachListener failed"));
-        return;
-      }
-
-      // Keep-alive pings so proxies don’t close the connection
-      const ka = setInterval(() => {
-        try {
-          res.write(`: keep-alive ${Date.now()}\n\n`);
-        } catch {}
-      }, 20000);
-
-      // If the client disconnects, clean up
-      const abort = req.signal;
-      const onAbort = () => {
-        clearInterval(ka);
-        detachListener(code, res);
-        try { res.end(); } catch {}
-      };
-      abort.addEventListener("abort", onAbort);
-    },
-    cancel() {
-      // The abort handler above will run and detach the listener.
-    },
-  });
-
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-      // Required for Vercel/Next to flush progressively
-      "Transfer-Encoding": "chunked",
-      // Avoid buffering by CDNs / proxies
-      "X-Accel-Buffering": "no",
-    },
-  });
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        const res = {
+          write: (chunk) => controller.enqueue(new TextEncoder().encode(chunk)),
+          flush: () => {},
+          end: () => controller.close(),
+        };
+        attachListener(code, res);
+      },
+      cancel() {
+        detachListener(code);
+      },
+    }),
+    {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
+    }
+  );
 }
