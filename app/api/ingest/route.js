@@ -1,147 +1,148 @@
 // /app/api/ingest/route.js
-// Ingest mic chunks, transcribe (4o-mini-transcribe with fallback to whisper-1),
-// translate to requested languages, and broadcast via the in-memory session store.
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-export const runtime = "nodejs";           // required on Vercel for Blob/FormData
-export const dynamic = "force-dynamic";
+import { NextResponse } from 'next/server';
+import { addLine, getSession } from '@/app/api/_lib/sessionStore';
 
-import { NextResponse } from "next/server";
-
-// ✅ correct relative import (no alias):
-import { addLine, getSession } from "../_lib/sessionStore";
-
+const MIN_BYTES = 3500; // drop tiny blobs
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Ignore tiny blobs (bad recorder ticks, saves $)
-const MIN_BYTES = 1500;
+// Try 4o-mini-transcribe first, fall back to whisper-1 if the API says format/corruption.
+async function transcribeWithFallback(ab, contentType, inputLang) {
+  const ext =
+    contentType?.includes('wav') ? 'wav' :
+    contentType?.includes('mp3') ? 'mp3' :
+    contentType?.includes('ogg') ? 'ogg' :
+    contentType?.includes('m4a') ? 'm4a' : 'webm';
 
-function langHint(inputLang) {
-  if (!inputLang || inputLang.toUpperCase() === "AUTO") return undefined;
-  return (inputLang + "").split("-")[0]; // "en-US" -> "en"
-}
+  const file = new Blob([ab], { type: contentType || 'audio/webm' });
 
-function extFromType(ct = "") {
-  const t = ct.toLowerCase();
-  if (t.includes("wav")) return "wav";
-  if (t.includes("mp3")) return "mp3";
-  if (t.includes("ogg")) return "ogg";
-  if (t.includes("oga")) return "oga";
-  if (t.includes("m4a")) return "m4a";
-  if (t.includes("mp4")) return "mp4";
-  if (t.includes("mpeg") || t.includes("mpga")) return "mp3";
-  return "webm"; // most browsers: audio/webm;codecs=opus
-}
+  // 1) 4o-mini-transcribe
+  {
+    const fd = new FormData();
+    fd.append('file', file, `clip.${ext}`);
+    fd.append('model', 'gpt-4o-mini-transcribe');
+    if (inputLang && inputLang !== 'AUTO') {
+      const primary = inputLang.split('-')[0];
+      fd.append('language', primary);
+    }
 
-async function transcribeWith(model, ab, contentType, language) {
-  const form = new FormData();
-  form.append("file", new Blob([ab], { type: contentType }), `clip.${extFromType(contentType)}`);
-  form.append("model", model);
-  if (language) form.append("language", language);
+    const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+      body: fd,
+    });
 
-  const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
+    if (r.ok) return (await r.json())?.text?.trim() || '';
+
+    // If it looks like a format/corruption 400, we’ll try whisper-1 next
+    if (r.status !== 400) {
+      const t = await r.text().catch(() => '');
+      throw new Error(`transcribe failed (${r.status}): ${t}`);
+    }
+  }
+
+  // 2) whisper-1
+  const fd2 = new FormData();
+  fd2.append('file', file, `clip.${ext}`);
+  fd2.append('model', 'whisper-1');
+  if (inputLang && inputLang !== 'AUTO') {
+    const primary = inputLang.split('-')[0];
+    fd2.append('language', primary);
+  }
+
+  const r2 = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: form,
+    body: fd2,
   });
-  return r;
+
+  if (!r2.ok) {
+    const t = await r2.text().catch(() => '');
+    throw new Error(`whisper-1 failed (${r2.status}): ${t}`);
+  }
+  return (await r2.json())?.text?.trim() || '';
 }
 
-async function translateOne(target, englishText) {
-  const body = {
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: `Translate into ${target}. Output only the translation.` },
-      { role: "user", content: englishText },
-    ],
-    temperature: 0.2,
-  };
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) return "";
-  const j = await r.json().catch(() => null);
-  return (j?.choices?.[0]?.message?.content || "").trim();
+async function translateAll(englishText, targets) {
+  const results = await Promise.all(
+    targets.map(async (lang) => {
+      const prompt = `Translate the following into ${lang}. Return only the translation:\n\n${englishText}`;
+      const r = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          temperature: 0.2,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      });
+      if (!r.ok) return [lang, ''];
+      const j = await r.json();
+      return [lang, (j?.choices?.[0]?.message?.content || '').trim()];
+    })
+  );
+  return Object.fromEntries(results);
 }
 
 export async function POST(req) {
   try {
     const url = new URL(req.url);
-    const code = url.searchParams.get("code") || "";
-    const inputLang = url.searchParams.get("inputLang") || "AUTO";
-    const langsCsv = url.searchParams.get("langs") || "es";
-    const targets = langsCsv.split(",").map(s => s.trim()).filter(Boolean);
+    const code = url.searchParams.get('code') || '';
+    const inputLang = url.searchParams.get('inputLang') || 'AUTO';
+    const langsCsv = url.searchParams.get('langs') || 'es';
+    const targetLangs = langsCsv.split(',').map((s) => s.trim()).filter(Boolean);
 
-    if (!OPENAI_API_KEY) {
-      return NextResponse.json({ ok: false, error: "Missing OPENAI_API_KEY" }, { status: 500 });
-    }
-    if (!code) {
-      return NextResponse.json({ ok: false, error: "Missing session code" }, { status: 400 });
-    }
+    // Validate session & key
     const session = getSession(code);
-    if (!session) {
-      return NextResponse.json({ ok: false, error: "Session not found" }, { status: 404 });
+    if (!code || !session) {
+      return NextResponse.json({ ok: false, error: 'No such session' }, { status: 404 });
+    }
+    if (!OPENAI_API_KEY) {
+      return NextResponse.json({ ok: false, error: 'Missing OPENAI_API_KEY' }, { status: 500 });
     }
 
-    // raw audio
+    // Read audio
     const ab = await req.arrayBuffer();
     const bytes = ab.byteLength || 0;
     if (bytes < MIN_BYTES) {
-      // tiny or silent – ignore without error
-      return NextResponse.json({ ok: true, skipped: "tiny_chunk" });
+      // too tiny -> drop quietly to avoid noisy 400s
+      return NextResponse.json({ ok: true, skipped: 'tiny' });
     }
+    const contentType = req.headers.get('content-type') || 'audio/webm';
 
-    const contentType = req.headers.get("content-type") || "audio/webm";
-    const language = langHint(inputLang);
-
-    // Try 4o-mini-transcribe first
-    let txText = "";
-    let firstErr = null;
-
-    let r = await transcribeWith("gpt-4o-mini-transcribe", ab, contentType, language);
-    if (!r.ok) {
-      firstErr = await r.text().catch(() => "");
-      // Fallback to whisper-1 (often more permissive about webm/opus)
-      r = await transcribeWith("whisper-1", ab, contentType, language);
-    }
-    if (!r.ok) {
-      const fallbackErr = await r.text().catch(() => "");
-      // Show a diagnostic line so the operator sees what happened
+    // Transcribe (with fallback)
+    let englishText = '';
+    try {
+      englishText = await transcribeWithFallback(ab, contentType, inputLang);
+    } catch (e) {
+      // Tell the operator what happened
       addLine(code, {
         ts: Date.now(),
-        en: `[transcribe error ${r.status}]`,
-        tx: Object.fromEntries(targets.map(t => [t, ""])),
+        en: `[transcribe error] ${(e?.message || '').slice(0, 180)}`,
+        tx: Object.fromEntries(targetLangs.map((l) => [l, ''])),
       });
-      return NextResponse.json(
-        { ok: false, error: "transcription_failed", firstErr, fallbackErr },
-        { status: 502 }
-      );
+      return NextResponse.json({ ok: false, error: 'transcription_failed' }, { status: 502 });
     }
-    const j = await r.json().catch(() => ({}));
-    txText = (j?.text || "").trim();
 
-    if (!txText) {
-      // Nothing recognized; do not fan out translations
+    if (!englishText) {
+      // silence/no speech
       return NextResponse.json({ ok: true, empty: true });
     }
 
-    // Translate in parallel
-    const translations = Object.fromEntries(
-      await Promise.all(
-        targets.map(async (t) => [t, await translateOne(t, txText)])
-      )
-    );
+    // Translate
+    const translations = await translateAll(englishText, targetLangs);
 
     // Broadcast
-    addLine(code, { ts: Date.now(), en: txText, tx: translations });
+    addLine(code, { ts: Date.now(), en: englishText, tx: translations });
 
     return NextResponse.json({ ok: true });
   } catch (err) {
-    console.error("ingest fatal error", err);
-    return NextResponse.json({ ok: false, error: "server_error" }, { status: 500 });
+    console.error('ingest fatal', err);
+    return NextResponse.json({ ok: false, error: 'server_error' }, { status: 500 });
   }
 }
