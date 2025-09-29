@@ -1,5 +1,5 @@
-// Simple in-memory store (reset on each deploy)
-const sessions = new Map(); // code -> { active, lines[], listeners: Set(res) }
+// Simple in-memory store (resets on each deploy)
+const sessions = new Map(); // code -> { active: true, lines: [], listeners: Set(res) }
 
 export function newCode() {
   return Math.random().toString(36).slice(2, 6).toUpperCase();
@@ -45,7 +45,6 @@ export function attachListener(code, res) {
   const s = sessions.get(code);
   if (!s || !s.active) return false;
   s.listeners.add(res);
-  // send history
   for (const line of s.lines) {
     res.write?.(`data: ${JSON.stringify(line)}\n\n`);
   }
