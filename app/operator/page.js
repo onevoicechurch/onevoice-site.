@@ -1,75 +1,191 @@
 'use client';
-import { useState, useRef } from 'react';
+
+import { useEffect, useRef, useState } from 'react';
+
+// === constants ===
+const SEG_MS = 5000; // finalize a chunk every 5s (prevents 400 "invalid container" errors)
+
+// === helpers ===
+function newCode() {
+  return Math.random().toString(36).slice(2, 6).toUpperCase();
+}
 
 export default function OperatorPage() {
-  const [code, setCode] = useState<string | null>(null);
+  // state (PLAIN JS — no TypeScript generics!)
+  const [code, setCode] = useState(null);          // session code
   const [inputLang, setInputLang] = useState('AUTO');
   const [running, setRunning] = useState(false);
-  const [log, setLog] = useState<any[]>([]);
+  const [status, setStatus] = useState('Idle');
+  const [log, setLog] = useState([]);              // [{time, text}]
 
-  const mediaRef = useRef<MediaStream | null>(null);
-  const recRef = useRef<MediaRecorder | null>(null);
+  // refs
+  const mediaRef = useRef(null);        // MediaStream
+  const recRef = useRef(null);          // MediaRecorder
+  const segTimerRef = useRef(0);        // segment timer id
 
-  async function startSession() {
+  // --- mic control (segmenting recorder) ---
+  async function startMic() {
+    if (running) return;
+    setStatus('Requesting mic…');
     try {
-      setLog([]);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true },
+        video: false,
+      });
+      mediaRef.current = stream;
+
+      const mimeType =
+        MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' :
+        MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' :
+        MediaRecorder.isTypeSupported('audio/ogg;codecs=opus') ? 'audio/ogg;codecs=opus' :
+        '';
+
+      const startRecorder = () => {
+        const rec = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+        recRef.current = rec;
+
+        rec.ondataavailable = async (e) => {
+          // only after stop() (final container)
+          if (!e.data || e.data.size < 6000) return;
+          try {
+            const qs = new URLSearchParams({
+              code: code || '',
+              inputLang,
+            });
+            const ab = await e.data.arrayBuffer();
+            await fetch('/api/ingest?' + qs.toString(), {
+              method: 'POST',
+              headers: { 'Content-Type': e.data.type || 'audio/webm' },
+              body: ab,
+            });
+            setStatus('Chunk processed');
+          } catch (err) {
+            console.error('ingest error', err);
+            setStatus('Ingest error');
+          }
+        };
+
+        rec.onstart = () => {
+          // stop after SEG_MS so we finalize and immediately restart
+          segTimerRef.current = window.setTimeout(() => {
+            try {
+              if (rec.state !== 'inactive') rec.stop();
+            } catch {}
+          }, SEG_MS);
+        };
+
+        rec.onstop = () => {
+          window.clearTimeout(segTimerRef.current);
+          // chain next segment while mic is still active
+          if (running && mediaRef.current) startRecorder();
+        };
+
+        rec.start(); // we’ll call stop() ourselves via the timer
+      };
+
       setRunning(true);
-      setCode(Math.random().toString(36).substring(2, 6).toUpperCase());
-      setLog(l => [...l, { text: 'Session ready', time: new Date() }]);
-    } catch (e: any) {
+      setStatus('Mic on');
+      startRecorder();
+    } catch (err) {
+      console.error('mic error', err);
+      setStatus('Mic error');
       setRunning(false);
-      setLog(l => [...l, { text: 'Session error', time: new Date() }]);
-      console.error('session error', e);
     }
   }
 
-  function endSession() {
+  function stopMic() {
     setRunning(false);
+    window.clearTimeout(segTimerRef.current);
+    try {
+      const r = recRef.current;
+      if (r && r.state !== 'inactive') r.stop();
+    } catch {}
+    recRef.current = null;
+
+    if (mediaRef.current) {
+      try {
+        mediaRef.current.getTracks().forEach(t => t.stop());
+      } catch {}
+      mediaRef.current = null;
+    }
+    setStatus('Mic off');
+  }
+
+  // end session (resets state)
+  function endSession() {
+    stopMic();
     setCode(null);
-    setLog(l => [...l, { text: 'Session ended', time: new Date() }]);
+    setLog(l => [...l, { time: Date.now(), text: 'Session ended' }]);
+  }
+
+  // clean up on unmount
+  useEffect(() => {
+    return () => stopMic();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // new session
+  function newSession() {
+    const c = newCode();
+    setCode(c);
+    setLog([{ time: Date.now(), text: `Session ${c} ready` }]);
+    setStatus('Ready');
   }
 
   return (
-    <div style={{ padding: 20, fontFamily: 'sans-serif' }}>
-      <h2>🎙️ Operator Console (Whisper)</h2>
-      <div style={{ marginBottom: 12 }}>
-        <strong>Access Code:</strong> {code || '----'}{' '}
-        <button onClick={startSession} disabled={running}>
-          New Session
-        </button>{' '}
-        <button onClick={endSession} disabled={!running}>
-          End Session
-        </button>
+    <div style={{ padding: 20, fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, sans-serif' }}>
+      <h2 style={{ marginTop: 0 }}>🎙️ Operator Console (Whisper)</h2>
+
+      <div style={{ marginBottom: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <div><strong>Access Code:</strong> {code || '----'}</div>
+        <button onClick={newSession} disabled={running}>New Session</button>
+        {code && (
+          <a href={`/s/${code}`} target="_blank" rel="noreferrer">Open Listener</a>
+        )}
       </div>
-      <div style={{ marginBottom: 12 }}>
-        <label>Input language: </label>
-        <select
-          value={inputLang}
-          onChange={e => setInputLang(e.target.value)}
-          disabled={running}
-        >
+
+      <div style={{ marginBottom: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <label>Input language:</label>
+        <select value={inputLang} onChange={e => setInputLang(e.target.value)} disabled={running}>
           <option value="AUTO">Auto-detect</option>
-          <option value="en">English</option>
+          <option value="en">English (United States)</option>
           <option value="es">Spanish</option>
           <option value="vi">Vietnamese</option>
           <option value="zh">Chinese</option>
         </select>
+
+        {!running ? (
+          <button onClick={startMic} disabled={!code}>🎤 Mic ON</button>
+        ) : (
+          <button onClick={stopMic} style={{ background: '#e33', color: '#fff' }}>🛑 Mic OFF</button>
+        )}
+
+        <button onClick={endSession} disabled={!code}>End Session</button>
+        <span style={{ opacity: 0.75 }}>Status: {status}</span>
       </div>
-      <h3>Live Preview (spoken text)</h3>
+
+      <h3 style={{ margin: '8px 0' }}>Live Preview (spoken text)</h3>
       <div
         style={{
           background: '#0b1c2c',
-          color: '#fff',
-          padding: 10,
-          borderRadius: 6,
-          minHeight: 120,
+          color: 'white',
+          padding: 14,
+          borderRadius: 8,
+          minHeight: 160,
+          boxShadow: '0 2px 10px rgba(0,0,0,0.25)',
+          maxWidth: 900,
         }}
       >
-        {log.map((entry, i) => (
-          <div key={i}>
-            🗣️ {new Date(entry.time).toLocaleTimeString()} — {entry.text}
-          </div>
-        ))}
+        {log.length === 0 ? (
+          <div style={{ opacity: 0.6 }}>No text yet…</div>
+        ) : (
+          log.map((entry, i) => (
+            <div key={i} style={{ marginBottom: 6 }}>
+              <span role="img" aria-label="speech">🗣️</span>{' '}
+              {new Date(entry.time).toLocaleTimeString()} — {entry.text}
+            </div>
+          ))
+        )}
       </div>
     </div>
   );
