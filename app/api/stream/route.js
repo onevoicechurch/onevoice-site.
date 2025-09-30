@@ -1,39 +1,36 @@
+import { NextResponse } from 'next/server';
+import { attachListener, detachListener, getSession } from '@/app/api/_lib/sessionStore';
+
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-import { NextResponse } from 'next/server';
-import { getSession, attachListener, detachListener } from '../_lib/sessionStore';
-
 export async function GET(req) {
-  const url = new URL(req.url);
-  const code = url.searchParams.get('code') || '';
-  const s = getSession(code);
-  if (!s) return new NextResponse('no session', { status: 404 });
+  const { searchParams } = new URL(req.url);
+  const code = searchParams.get('code')?.toUpperCase();
+  if (!code || !getSession(code)) {
+    return new NextResponse('missing or invalid code', { status: 400 });
+  }
 
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
-      const resLike = {
-        write: (chunk) => controller.enqueue(encoder.encode(chunk)),
-        flush: () => {},
-        end: () => controller.close(),
+      const resShim = {
+        write(chunk) { controller.enqueue(encoder.encode(chunk)); },
+        end() { try { controller.close(); } catch {} },
+        flush() {}
       };
-      attachListener(code, resLike);
-
-      // keep-alive ping
+      attachListener(code, resShim);
+      // keepalive ping
       const ping = setInterval(() => {
-        controller.enqueue(encoder.encode(': ping\n\n'));
+        try { resShim.write(`event: ping\ndata: {}\n\n`); } catch {}
       }, 15000);
 
       // on cancel
-      controller._cleanup = () => {
+      controller.oncancel = () => {
         clearInterval(ping);
-        detachListener(code, resLike);
+        detachListener(code, resShim);
       };
-    },
-    cancel() {
-      this._cleanup?.();
-    },
+    }
   });
 
   return new NextResponse(stream, {
@@ -41,6 +38,7 @@ export async function GET(req) {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
-    },
+      'X-Accel-Buffering': 'no'
+    }
   });
 }
