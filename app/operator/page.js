@@ -2,53 +2,40 @@
 
 import { useEffect, useRef, useState } from 'react';
 
-/** Languages we ask the server to prepare for listeners (quietly) */
-const LANGS_CSV =
-  [
-    'af','ar','bg','ca','cs','da','de','el','en','es','et','fa','fi','fr','he','hi','hr','hu','id','it',
-    'ja','ko','lt','lv','ms','nl','no','pl','pt','pt-BR','ro','ru','sk','sl','sr','sv','sw','ta','th',
-    'tr','uk','ur','vi','zh','zh-TW','bn','fil','gu','kn','ml','mr'
-  ].join(',');
-
-// mic/recording knobs
-const SEG_MS = 5000;      // record finalized 5s segments
-const MIN_SEND_B = 2000;  // lower threshold so the first chunk always posts
+const SEG_MS = 5000;         // record 5s finalized segments
+const MIN_SEND_B = 6000;     // drop tiny blobs
 
 const INPUT_LANGS = [
   { code: 'AUTO', label: 'Auto-detect (Whisper)' },
   { code: 'en-US', label: 'English (United States)' },
   { code: 'en-GB', label: 'English (United Kingdom)' },
-  { code: 'en-AU', label: 'English (Australia)' },
-  { code: 'en-CA', label: 'English (Canada)' },
+  { code: 'es-US', label: 'Spanish (United States)' },
   { code: 'es-ES', label: 'Spanish (Spain)' },
   { code: 'es-MX', label: 'Spanish (Mexico)' },
-  { code: 'es-US', label: 'Spanish (United States)' },
   { code: 'vi-VN', label: 'Vietnamese (Vietnam)' },
-  { code: 'zh-CN', label: 'Chinese (Simplified)' },
-  { code: 'zh-TW', label: 'Chinese (Traditional)' },
+  { code: 'pt-BR', label: 'Portuguese (Brazil)' },
+  { code: 'fr-FR', label: 'French (France)' },
+  { code: 'de-DE', label: 'German (Germany)' },
+  { code: 'zh-CN', label: 'Chinese (Mandarin)' },
 ];
 
 export default function Operator() {
-  const [code, setCode] = useState(null);
-  const [inputLang, setInputLang] = useState('AUTO');
+  const [code, setCode] = useState('');
+  const [inputLang, setInputLang] = useState('en-US');
   const [running, setRunning] = useState(false);
-  const [log, setLog] = useState([]); // preview of SPOKEN text only
+  const [log, setLog] = useState([]);
 
   const mediaRef = useRef(null);
-  const recRef   = useRef(null);
-  const runningRef = useRef(false);
+  const recRef = useRef(null);
+  const segTimerRef = useRef(0);
+  const esRef = useRef(null);
 
-  const origin = typeof window !== 'undefined' ? window.location.origin : 'https://onevoice.church';
-  const listenerUrl = code ? `${origin}/s/${encodeURIComponent(code)}` : '#';
-  const qrUrl = code
-    ? `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(listenerUrl)}`
-    : '';
-
-  // load + persist small prefs
+  // bootstrap code & prefs
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    setCode(localStorage.getItem('ov:lastCode') || Math.random().toString(36).slice(2, 6).toUpperCase());
-    setInputLang(localStorage.getItem('ov:inputLang') || 'AUTO');
+    const last = localStorage.getItem('ov:lastCode') || Math.random().toString(36).slice(2, 6).toUpperCase();
+    setCode(last);
+    setInputLang(localStorage.getItem('ov:inputLang') || 'en-US');
   }, []);
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -56,32 +43,34 @@ export default function Operator() {
     localStorage.setItem('ov:inputLang', inputLang);
   }, [code, inputLang]);
 
-  // live preview via SSE – show the *spoken* text (any language)
+  // LIVE PREVIEW via SSE (spoken text only)
   useEffect(() => {
     if (!code) return;
     const es = new EventSource(`/api/stream?code=${encodeURIComponent(code)}`);
+    esRef.current = es;
     es.onmessage = (e) => {
       try {
-        const line = JSON.parse(e.data);
-        // prefer the original spoken text (stored as .en in our server payload),
-        // but fall back to the first available translation if needed
-        const spoken = line.en || (line.tx && Object.values(line.tx).find(Boolean)) || '';
-        if (spoken) setLog((prev) => [...prev, { ts: line.ts, text: spoken }].slice(-200));
+        const line = JSON.parse(e.data); // { ts, en }
+        if (!line?.en) return;
+        setLog((prev) => [...prev, { ts: line.ts, text: line.en }].slice(-200));
       } catch {}
     };
     es.addEventListener('end', () => es.close());
-    return () => es.close();
+    return () => { try { es.close(); } catch {} };
   }, [code]);
 
   async function newSession() {
     const r = await fetch('/api/session', { method: 'POST' });
     const j = await r.json();
-    if (j.code) setCode(j.code);
+    if (j.code) {
+      setCode(j.code);
+      setLog([]);
+    }
   }
 
   async function endSession() {
     if (!code) return;
-    await fetch(`/api/session?code=${encodeURIComponent(code)}`, { method: 'DELETE' });
+    try { await fetch(`/api/session?code=${encodeURIComponent(code)}`, { method: 'DELETE' }); } catch {}
     stopMic();
     setLog([]);
   }
@@ -93,19 +82,17 @@ export default function Operator() {
     });
     mediaRef.current = stream;
 
+    // pick a very compatible mimeType
     const mimeType =
-      MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' :
-      MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' :
-      MediaRecorder.isTypeSupported('audio/ogg;codecs=opus') ? 'audio/ogg;codecs=opus' :
+      (MediaRecorder.isTypeSupported('audio/webm;codecs=opus') && 'audio/webm;codecs=opus') ||
+      (MediaRecorder.isTypeSupported('audio/webm') && 'audio/webm') ||
+      (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus') && 'audio/ogg;codecs=opus') ||
       '';
 
-    runningRef.current = true;
-    setRunning(true);
+    let recorder;
 
     const startRecorder = () => {
-      if (!runningRef.current || !mediaRef.current) return;
-
-      const recorder = mimeType ? new MediaRecorder(mediaRef.current, { mimeType }) : new MediaRecorder(mediaRef.current);
+      recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
       recRef.current = recorder;
 
       recorder.ondataavailable = async (e) => {
@@ -113,8 +100,9 @@ export default function Operator() {
         try {
           const qs = new URLSearchParams({
             code: code || '',
-            inputLang,
-            langs: LANGS_CSV, // listeners get a big menu
+            inputLang: inputLang || 'AUTO',
+            // send a harmless langs=es so /api/ingest stays happy even if you don't use tx
+            langs: 'es',
           });
           const ab = await e.data.arrayBuffer();
           await fetch('/api/ingest?' + qs.toString(), {
@@ -127,36 +115,43 @@ export default function Operator() {
         }
       };
 
-      let segTimer = 0;
       recorder.onstart = () => {
-        segTimer = window.setTimeout(() => {
+        segTimerRef.current = window.setTimeout(() => {
           try { recorder.state !== 'inactive' && recorder.stop(); } catch {}
         }, SEG_MS);
       };
+
       recorder.onstop = () => {
-        window.clearTimeout(segTimer);
-        if (runningRef.current) startRecorder();
+        window.clearTimeout(segTimerRef.current);
+        if (running && mediaRef.current) startRecorder(); // immediately roll into next segment
       };
 
-      recorder.start();
+      recorder.start(); // no timeslice; we stop manually to finalize the container
     };
 
     startRecorder();
+    setRunning(true);
   }
 
   function stopMic() {
-    runningRef.current = false;
     setRunning(false);
     try { recRef.current && recRef.current.state !== 'inactive' && recRef.current.stop(); } catch {}
+    window.clearTimeout(segTimerRef.current);
     if (mediaRef.current) {
       mediaRef.current.getTracks().forEach((t) => t.stop());
       mediaRef.current = null;
     }
   }
 
+  const origin = typeof window !== 'undefined' ? window.location.origin : '';
+  const listenerUrl = code ? `${origin}/s/${encodeURIComponent(code)}` : '#';
+  const qrUrl = code
+    ? `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(listenerUrl)}`
+    : '';
+
   return (
     <main style={{ minHeight: '100vh', padding: 24, color: 'white', background: 'linear-gradient(135deg,#0e1a2b,#153a74 60%,#0f3070)' }}>
-      <div style={{ maxWidth: 960, margin: '0 auto' }}>
+      <div style={{ maxWidth: 980, margin: '0 auto' }}>
         <h1>🎚️ Operator Console (Whisper)</h1>
         <p style={{ opacity: 0.9 }}>Share the code/QR. Pick input language (or Auto). Start the mic.</p>
 
@@ -176,7 +171,7 @@ export default function Operator() {
           </div>
         )}
 
-        <div style={{ display: 'flex', gap: 12, marginTop: 16, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: 12, marginTop: 16, flexWrap: 'wrap', alignItems: 'center' }}>
           <label>
             <span style={{ marginRight: 8 }}>Input language:</span>
             <select value={inputLang} onChange={(e) => setInputLang(e.target.value)} style={{ padding: 8, borderRadius: 8 }}>
@@ -192,7 +187,7 @@ export default function Operator() {
             </button>
           ) : (
             <button onClick={stopMic} style={{ padding: '8px 12px', borderRadius: 8, border: 'none', background: '#ff5555', color: 'white', fontWeight: 700, cursor: 'pointer' }}>
-              ⏹️ Mic OFF
+              🟥 Mic OFF
             </button>
           )}
 
@@ -202,9 +197,9 @@ export default function Operator() {
         </div>
 
         <h3 style={{ marginTop: 18 }}>Live Preview (spoken text)</h3>
-        <div style={{ background: '#0b1220', color: 'white', padding: 12, borderRadius: 8, minHeight: 220, lineHeight: 1.6 }}>
+        <div style={{ background: '#0b1220', color: 'white', padding: 16, borderRadius: 10, minHeight: 220, lineHeight: 1.55 }}>
           {log.map((l) => (
-            <div key={l.ts + Math.random()} style={{ marginBottom: 10 }}>
+            <div key={l.ts} style={{ marginBottom: 10 }}>
               <div style={{ opacity: 0.6, fontSize: 12 }}>{new Date(l.ts).toLocaleTimeString()}</div>
               <div>🗣️ {l.text}</div>
             </div>
