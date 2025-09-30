@@ -1,49 +1,46 @@
 import { NextResponse } from 'next/server';
-import { appendLine } from '@/app/api/_lib/sessionStore';
 import OpenAI from 'openai';
+import { addLine, isReady } from '../_lib/sessionStore';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// Choose your ASR model here
+const ASR_MODEL = 'gpt-4o-mini-transcribe'; // or 'whisper-1'
+
 export async function POST(req) {
   try {
     const url = new URL(req.url);
-    const code = (url.searchParams.get('code') || '').toString().trim().slice(0, 8);
-    const inputLang = (url.searchParams.get('inputLang') || '').toString().trim(); // optional hint
-    if (!code) return NextResponse.json({ ok: false, error: 'missing code' }, { status: 400 });
+    const code = (url.searchParams.get('code') || '').toUpperCase();
+    if (!code || !isReady(code)) {
+      return NextResponse.json({ ok: false, error: 'bad_code' }, { status: 400 });
+    }
 
-    // Read finalized audio blob
-    const type = req.headers.get('content-type') || 'audio/webm';
-    const buf = Buffer.from(await req.arrayBuffer());
-    if (!buf.length) return NextResponse.json({ ok: false, error: 'empty body' }, { status: 400 });
+    const contentType = req.headers.get('content-type') || 'audio/webm';
+    const ab = await req.arrayBuffer();
+    if (!ab || ab.byteLength < 4000) {
+      return NextResponse.json({ ok: false, error: 'audio_too_small' }, { status: 400 });
+    }
 
-    // Name with proper extension so Whisper is happy
-    const ext = type.includes('ogg') ? 'ogg'
-              : type.includes('webm') ? 'webm'
-              : type.includes('mp3') ? 'mp3'
-              : type.includes('m4a') ? 'm4a'
-              : type.includes('wav') ? 'wav'
-              : 'webm';
-
-    const file = new File([buf], `chunk.${ext}`, { type });
+    // Turn raw bytes into a File for the SDK
+    const buf = Buffer.from(ab);
+    const file = new File([buf], `chunk.${contentType.includes('ogg') ? 'ogg' : 'webm'}`, { type: contentType });
 
     // Transcribe
-    const resp = await openai.audio.transcriptions.create({
+    const tr = await openai.audio.transcriptions.create({
       file,
-      model: 'whisper-1',
-      language: inputLang || undefined, // let auto-detect unless operator picked one
-      response_format: 'verbose_json',
-      temperature: 0,
+      model: ASR_MODEL,
+      // You can add language hints here later if desired: language: 'en'
     });
 
-    const text = (resp?.text || '').trim();
-    if (text) appendLine(code, text);
+    const text = (tr?.text || '').trim();
+    if (text) addLine(code, text);
 
     return NextResponse.json({ ok: true, text });
   } catch (e) {
     console.error('ingest error', e);
-    return NextResponse.json({ ok: false, error: 'transcribe_failed' }, { status: 500 });
+    return NextResponse.json({ ok: false, error: 'ingest_failed' }, { status: 500 });
   }
 }
