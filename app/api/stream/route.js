@@ -1,17 +1,40 @@
-import { NextResponse } from 'next/server';
-import { getSince } from '../_lib/sessionStore';
+import { getLinesSince } from '../_lib/sessionStore';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-export async function GET(req) {
-  try {
-    const url = new URL(req.url);
-    const code = (url.searchParams.get('code') || '').toUpperCase();
-    const since = parseInt(url.searchParams.get('since') || '0', 10);
-    const { items, next } = getSince(code, since);
-    return NextResponse.json({ ok: true, items, next });
-  } catch {
-    return NextResponse.json({ ok: false, items: [], next: 0 }, { status: 500 });
-  }
+function sseTransform() {
+  const encoder = new TextEncoder();
+  return new TransformStream({
+    transform(chunk, controller) {
+      controller.enqueue(encoder.encode(chunk));
+    }
+  });
 }
+
+export async function GET(req) {
+  const u = new URL(req.url);
+  const code = (u.searchParams.get('code') || '').toUpperCase();
+  const since = Number(u.searchParams.get('since') || 0);
+
+  if (!code) {
+    return new Response('missing code', { status: 400 });
+  }
+
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const send = async (obj) => writer.write(`data: ${JSON.stringify(obj)}\n\n`);
+
+  // Kick initial batch
+  let lastId = Number.isNaN(since) ? 0 : since;
+  const initial = await getLinesSince(code, lastId, 100);
+  if (initial.length) {
+    lastId = initial[initial.length - 1].id;
+    await send({ type: 'batch', lines: initial });
+  } else {
+    await send({ type: 'noop' });
+  }
+
+  // Poll loop (lightweight) for up to 60s; client will reconnect
+  let alive = true;
+  req.signal.addEventListener('abort', () =>
