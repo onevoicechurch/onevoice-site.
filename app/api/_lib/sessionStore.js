@@ -1,5 +1,6 @@
-// Simple in-memory session store (resets on each deploy)
-const sessions = new Map(); // code -> { active: true, lines: [], listeners: Set(res) }
+// Simple in-memory store (reset on each deploy)
+const sessions = new Map();
+// code -> { active: true, lines: [], listeners: Set(res) }
 
 export function newCode() {
   return Math.random().toString(36).slice(2, 6).toUpperCase();
