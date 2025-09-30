@@ -1,59 +1,27 @@
-// Simple in-memory store (reset on each deploy)
-const sessions = new Map();
-// code -> { active: true, lines: [], listeners: Set(res) }
-
-export function newCode() {
-  return Math.random().toString(36).slice(2, 6).toUpperCase();
-}
+// Simple in-memory store (one deployment/region). Good enough for demos.
+const sessions = new Map(); // code -> { log: Array<{ts:number,text:string}>, cursor:number }
 
 export function createSession(code) {
-  sessions.set(code, { active: true, lines: [], listeners: new Set() });
-  return code;
+  if (!code) return;
+  if (!sessions.has(code)) sessions.set(code, { log: [], cursor: 0 });
+  return { ok: true };
 }
 
 export function endSession(code) {
-  const s = sessions.get(code);
-  if (!s) return false;
-  s.active = false;
-  for (const res of s.listeners) {
-    try {
-      res.write?.(`event: end\ndata: {}\n\n`);
-      res.flush?.();
-      res.end?.();
-    } catch {}
-  }
   sessions.delete(code);
-  return true;
+  return { ok: true };
 }
 
-export function getSession(code) {
-  return sessions.get(code);
-}
-
-export function addLine(code, line) {
+export function appendLine(code, text) {
   const s = sessions.get(code);
-  if (!s || !s.active) return false;
-  s.lines.push(line);
-  const payload = JSON.stringify(line);
-  for (const res of s.listeners) {
-    res.write?.(`data: ${payload}\n\n`);
-    res.flush?.();
-  }
-  return true;
+  if (!s) return;
+  s.log.push({ ts: Date.now(), text });
+  s.cursor = s.log.length;
 }
 
-export function attachListener(code, res) {
+export function getSince(code, since = 0) {
   const s = sessions.get(code);
-  if (!s || !s.active) return false;
-  s.listeners.add(res);
-  // send history
-  for (const line of s.lines) {
-    res.write?.(`data: ${JSON.stringify(line)}\n\n`);
-  }
-  return true;
-}
-
-export function detachListener(code, res) {
-  const s = sessions.get(code);
-  if (s) s.listeners.delete(res);
+  if (!s) return { items: [], next: since };
+  const start = Number.isFinite(since) ? since : 0;
+  return { items: s.log.slice(start), next: s.log.length };
 }
