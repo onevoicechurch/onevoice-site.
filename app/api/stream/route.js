@@ -1,37 +1,46 @@
-import { getSession, attachListener, detachListener } from "../_lib/sessionStore";
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+import { NextResponse } from 'next/server';
+import { getSession, attachListener, detachListener } from '../_lib/sessionStore';
 
 export async function GET(req) {
-  const searchParams = new URL(req.url).searchParams;
-  const code = searchParams.get("code");
+  const url = new URL(req.url);
+  const code = url.searchParams.get('code') || '';
+  const s = getSession(code);
+  if (!s) return new NextResponse('no session', { status: 404 });
 
-  const session = getSession(code);
-  if (!code || !session) {
-    return new Response(JSON.stringify({ ok: false, error: "No such session" }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
+  const stream = new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder();
+      const resLike = {
+        write: (chunk) => controller.enqueue(encoder.encode(chunk)),
+        flush: () => {},
+        end: () => controller.close(),
+      };
+      attachListener(code, resLike);
 
-  return new Response(
-    new ReadableStream({
-      start(controller) {
-        const res = {
-          write: (chunk) => controller.enqueue(new TextEncoder().encode(chunk)),
-          flush: () => {},
-          end: () => controller.close(),
-        };
-        attachListener(code, res);
-      },
-      cancel() {
-        detachListener(code);
-      },
-    }),
-    {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      },
-    }
-  );
+      // keep-alive ping
+      const ping = setInterval(() => {
+        controller.enqueue(encoder.encode(': ping\n\n'));
+      }, 15000);
+
+      // on cancel
+      controller._cleanup = () => {
+        clearInterval(ping);
+        detachListener(code, resLike);
+      };
+    },
+    cancel() {
+      this._cleanup?.();
+    },
+  });
+
+  return new NextResponse(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+    },
+  });
 }
