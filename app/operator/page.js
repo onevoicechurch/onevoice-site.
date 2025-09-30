@@ -2,10 +2,10 @@
 
 import { useEffect, useRef, useState } from 'react';
 
-/* ---------- TUNING ---------- */
-const SEG_MS = 5000;          // record 5s finalized segments (prevents 400s)
-const MIN_SEND_B = 6000;      // ignore tiny blobs
-/* ---------------------------- */
+// -------- knobs --------
+const SEG_MS = 5000;          // record finalized 5s segments
+const MIN_SEND_B = 6000;      // drop tiny blobs
+// -----------------------
 
 const INPUT_LANGS = [
   { code: 'AUTO', label: 'Auto-detect (Whisper)' },
@@ -26,29 +26,25 @@ export default function Operator() {
   const [running, setRunning] = useState(false);
   const [log, setLog] = useState([]);
 
-  // media + recorder refs
-  const mediaRef = useRef(null);     // MediaStream
-  const recRef = useRef(null);       // MediaRecorder
+  // media + recorder
+  const mediaRef = useRef(null);
+  const recRef = useRef(null);
+  const runningRef = useRef(false); // used inside callbacks
 
-  const origin =
-    typeof window !== 'undefined' ? window.location.origin : 'https://onevoice.church';
+  // URLs
+  const origin = typeof window !== 'undefined' ? window.location.origin : 'https://onevoice.church';
   const listenerUrl = code ? `${origin}/s/${encodeURIComponent(code)}` : '#';
   const qrUrl = code
     ? `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(listenerUrl)}`
     : '';
 
-  // load prefs
+  // load + persist small prefs
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    setCode(
-      localStorage.getItem('ov:lastCode') ||
-        Math.random().toString(36).slice(2, 6).toUpperCase()
-    );
+    setCode(localStorage.getItem('ov:lastCode') || Math.random().toString(36).slice(2, 6).toUpperCase());
     setInputLang(localStorage.getItem('ov:inputLang') || 'AUTO');
     setLangsCsv(localStorage.getItem('ov:langs') || 'es,vi,zh');
   }, []);
-
-  // persist prefs
   useEffect(() => {
     if (typeof window === 'undefined') return;
     if (code) localStorage.setItem('ov:lastCode', code);
@@ -56,7 +52,7 @@ export default function Operator() {
     localStorage.setItem('ov:langs', langsCsv);
   }, [code, inputLang, langsCsv]);
 
-  // live preview via SSE (already coalesced by backend)
+  // live preview via SSE
   useEffect(() => {
     if (!code) return;
     const es = new EventSource(`/api/stream?code=${encodeURIComponent(code)}`);
@@ -83,32 +79,30 @@ export default function Operator() {
     setLog([]);
   }
 
-  // -------- Mic handling with 5s finalized segments --------
   async function startMic() {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true },
       video: false,
     });
     mediaRef.current = stream;
-    setRunning(true);
 
-    // choose a very compatible mimeType
+    // safest mime choices; we’ll let the browser pick the first it supports
     const mimeType =
       MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' :
       MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' :
-      MediaRecorder.isTypeSupported('audio/ogg;codecs=opus') ? 'audio/ogg;codecs=opus' :
-      '';
+      MediaRecorder.isTypeSupported('audio/ogg;codecs=opus') ? 'audio/ogg;codecs=opus' : '';
 
-    let recorder;      // current MediaRecorder
-    let segTimer = 0;  // timer id
+    runningRef.current = true;
+    setRunning(true);
 
     const startRecorder = () => {
-      recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      if (!runningRef.current || !mediaRef.current) return;
+
+      const recorder = mimeType ? new MediaRecorder(mediaRef.current, { mimeType }) : new MediaRecorder(mediaRef.current);
+      recRef.current = recorder;
 
       recorder.ondataavailable = async (e) => {
-        // runs after stop(); container is finalized
         if (!e.data || e.data.size < MIN_SEND_B) return;
-
         try {
           const qs = new URLSearchParams({
             code: code || '',
@@ -126,26 +120,26 @@ export default function Operator() {
         }
       };
 
+      let segTimer = 0;
       recorder.onstart = () => {
         segTimer = window.setTimeout(() => {
           try { recorder.state !== 'inactive' && recorder.stop(); } catch {}
         }, SEG_MS);
       };
-
       recorder.onstop = () => {
         window.clearTimeout(segTimer);
-        // immediately start a fresh segment while mic keeps running
-        if (running && mediaRef.current) startRecorder();
+        // immediately roll to next segment while mic stays open
+        if (runningRef.current) startRecorder();
       };
 
-      recorder.start(); // no timeslice; we own stop()
-      recRef.current = recorder;
+      recorder.start(); // no timeslice; we stop after SEG_MS
     };
 
     startRecorder();
   }
 
   function stopMic() {
+    runningRef.current = false;
     setRunning(false);
     try { recRef.current && recRef.current.state !== 'inactive' && recRef.current.stop(); } catch {}
     if (mediaRef.current) {
@@ -153,7 +147,6 @@ export default function Operator() {
       mediaRef.current = null;
     }
   }
-  // ---------------------------------------------------------
 
   const firstLang = (langsCsv || 'es').split(',')[0].trim() || 'es';
 
@@ -217,7 +210,7 @@ export default function Operator() {
         <h3 style={{ marginTop: 18 }}>Live Preview</h3>
         <div style={{ background: '#0b1220', color: 'white', padding: 12, borderRadius: 8, minHeight: 180, lineHeight: 1.6 }}>
           {log.map((l) => (
-            <div key={l.ts + Math.random()} style={{ marginBottom: 8 }}>
+            <div key={l.ts + Math.random()} style={{ marginBottom: 10 }}>
               <div style={{ opacity: 0.6, fontSize: 12 }}>{new Date(l.ts).toLocaleTimeString()}</div>
               <div>🗣️ {l.en}</div>
               <div>🌍 {l.tx?.[firstLang]}</div>
