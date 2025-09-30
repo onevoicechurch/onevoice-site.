@@ -2,11 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 
-/**
- * We keep translations server-side, but the Operator UI no longer shows or edits them.
- * This CSV is sent quietly with each audio segment so listeners can pick any of these.
- * (You can trim this list later if you want to save tokens.)
- */
+/** Languages we ask the server to prepare for listeners (quietly) */
 const LANGS_CSV =
   [
     'af','ar','bg','ca','cs','da','de','el','en','es','et','fa','fi','fr','he','hi','hr','hu','id','it',
@@ -16,7 +12,7 @@ const LANGS_CSV =
 
 // mic/recording knobs
 const SEG_MS = 5000;      // record finalized 5s segments
-const MIN_SEND_B = 6000;  // drop tiny blobs
+const MIN_SEND_B = 2000;  // lower threshold so the first chunk always posts
 
 const INPUT_LANGS = [
   { code: 'AUTO', label: 'Auto-detect (Whisper)' },
@@ -36,14 +32,12 @@ export default function Operator() {
   const [code, setCode] = useState(null);
   const [inputLang, setInputLang] = useState('AUTO');
   const [running, setRunning] = useState(false);
-  const [log, setLog] = useState([]); // preview of the SPOKEN text only
+  const [log, setLog] = useState([]); // preview of SPOKEN text only
 
-  // media + recorder
   const mediaRef = useRef(null);
   const recRef   = useRef(null);
   const runningRef = useRef(false);
 
-  // URLs
   const origin = typeof window !== 'undefined' ? window.location.origin : 'https://onevoice.church';
   const listenerUrl = code ? `${origin}/s/${encodeURIComponent(code)}` : '#';
   const qrUrl = code
@@ -62,15 +56,17 @@ export default function Operator() {
     localStorage.setItem('ov:inputLang', inputLang);
   }, [code, inputLang]);
 
-  // live preview via SSE (ENGLISH / SPOKEN ONLY)
+  // live preview via SSE – show the *spoken* text (any language)
   useEffect(() => {
     if (!code) return;
     const es = new EventSource(`/api/stream?code=${encodeURIComponent(code)}`);
     es.onmessage = (e) => {
       try {
         const line = JSON.parse(e.data);
-        // Only show the source speech (server stores it as .en whatever the actual input language is)
-        setLog((prev) => [...prev, { ts: line.ts, text: line.en }].slice(-200));
+        // prefer the original spoken text (stored as .en in our server payload),
+        // but fall back to the first available translation if needed
+        const spoken = line.en || (line.tx && Object.values(line.tx).find(Boolean)) || '';
+        if (spoken) setLog((prev) => [...prev, { ts: line.ts, text: spoken }].slice(-200));
       } catch {}
     };
     es.addEventListener('end', () => es.close());
@@ -118,8 +114,7 @@ export default function Operator() {
           const qs = new URLSearchParams({
             code: code || '',
             inputLang,
-            // Operator no longer edits langs; we always ask the server to prep a big set for listeners
-            langs: LANGS_CSV,
+            langs: LANGS_CSV, // listeners get a big menu
           });
           const ab = await e.data.arrayBuffer();
           await fetch('/api/ingest?' + qs.toString(), {
