@@ -1,225 +1,167 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
-/** ---- Thoughtful flush heuristics ---- */
-const TERMINATORS = /[.!?…]+["”’)]*$/;
-const NUMBERS_ONLY = /^\s*\d+(?:\s*,\s*\d+)*\s*$/;                 // "2, 3"
-const THROWAWAY = /^(um+|uh+|erm|mm+|hmm+|ah+|eh+)$/i;              // fillers
-
-// phrases that often end a thought while preaching
-const SOFT_ENDERS = [
-  'right', 'okay', 'ok', 'amen', 'you know', 'you know?',
-  'what do you think', 'come on', 'can i get an amen', 'all right', 'alright'
+// 50+ language options (BCP-47-ish or ISO codes for display)
+const LANGS = [
+  { code: 'en', label: 'English' },
+  { code: 'es', label: 'Spanish' },
+  { code: 'vi', label: 'Vietnamese' },
+  { code: 'pt', label: 'Portuguese' },
+  { code: 'fr', label: 'French' },
+  { code: 'de', label: 'German' },
+  { code: 'it', label: 'Italian' },
+  { code: 'nl', label: 'Dutch' },
+  { code: 'sv', label: 'Swedish' },
+  { code: 'no', label: 'Norwegian' },
+  { code: 'da', label: 'Danish' },
+  { code: 'fi', label: 'Finnish' },
+  { code: 'pl', label: 'Polish' },
+  { code: 'cs', label: 'Czech' },
+  { code: 'ro', label: 'Romanian' },
+  { code: 'hu', label: 'Hungarian' },
+  { code: 'tr', label: 'Turkish' },
+  { code: 'el', label: 'Greek' },
+  { code: 'ru', label: 'Russian' },
+  { code: 'uk', label: 'Ukrainian' },
+  { code: 'ar', label: 'Arabic' },
+  { code: 'he', label: 'Hebrew' },
+  { code: 'hi', label: 'Hindi' },
+  { code: 'bn', label: 'Bengali' },
+  { code: 'ta', label: 'Tamil' },
+  { code: 'te', label: 'Telugu' },
+  { code: 'ml', label: 'Malayalam' },
+  { code: 'mr', label: 'Marathi' },
+  { code: 'gu', label: 'Gujarati' },
+  { code: 'pa', label: 'Punjabi' },
+  { code: 'id', label: 'Indonesian' },
+  { code: 'ms', label: 'Malay' },
+  { code: 'th', label: 'Thai' },
+  { code: 'ko', label: 'Korean' },
+  { code: 'ja', label: 'Japanese' },
+  { code: 'zh', label: 'Chinese' },
+  { code: 'sw', label: 'Swahili' },
+  { code: 'am', label: 'Amharic' },
+  { code: 'fa', label: 'Persian' },
+  { code: 'ur', label: 'Urdu' },
+  { code: 'yo', label: 'Yoruba' },
+  { code: 'ig', label: 'Igbo' },
+  { code: 'ha', label: 'Hausa' },
+  { code: 'af', label: 'Afrikaans' },
+  { code: 'bg', label: 'Bulgarian' },
+  { code: 'hr', label: 'Croatian' },
+  { code: 'sr', label: 'Serbian' },
+  { code: 'sk', label: 'Slovak' },
+  { code: 'sl', label: 'Slovenian' },
 ];
 
-const FLUSH_GAP_MS   = 1400;   // flush if this much “silence” since last chunk
-const MAX_PHRASE_LEN = 140;    // flush if a thought grows long
-
 export default function ListenerPage({ params }) {
-  const code = params.code;
+  const code = decodeURIComponent(params.code || '');
 
-  // UI state
-  const [lines, setLines] = useState([]);            // rendered transcript for this listener
+  const [speakEnabled, setSpeakEnabled] = useState(true);
   const [voices, setVoices] = useState([]);
   const [voiceId, setVoiceId] = useState(null);
-  const [speakEnabled, setSpeakEnabled] = useState(true);
+  const [lang, setLang] = useState('en'); // default English
+  const [lines, setLines] = useState([]);
 
-  // Refs for side-effectful systems
-  const esRef = useRef(null);                        // EventSource
-  const lastSeenTsRef = useRef(0);                   // last SSE ts processed
-  const bufferRef = useRef('');                      // sentence buffer
-  const lastMsgAtRef = useRef(0);                    // ms clock of last chunk
-  const flushTimerRef = useRef(0);                   // silence timer id
+  // TTS queue (strict order, no overlaps, never re-read history)
+  const audioRef = useRef(null);
+  const queueRef = useRef([]);      // array<{url}>
+  const playingRef = useRef(false);
 
-  const ttsQueueRef = useRef([]);                    // [{text, voiceId}]
-  const playingRef  = useRef(false);                 // is a clip currently playing
-  const audioRef    = useRef(null);                  // single Audio()
-
-  // keep the *current* voice in a ref so the SSE effect doesn’t depend on voiceId
-  const voiceRef = useRef(null);
-  useEffect(() => { voiceRef.current = voiceId; }, [voiceId]);
-
-  // ---- Load voices once ----
+  // load ElevenLabs voices from our API proxy
   useEffect(() => {
-    let alive = true;
     fetch('/api/voices')
-      .then(r => r.json())
-      .then(j => {
-        if (!alive) return;
-        const v = j?.voices || [];
-        setVoices(v);
-        if (v.length) setVoiceId(v[0].voice_id);
-      })
-      .catch(() => {});
-    return () => { alive = false; };
+      .then((r) => r.json())
+      .then((j) => {
+        const list = j?.voices || [];
+        setVoices(list);
+        if (list.length && !voiceId) setVoiceId(list[0].voice_id);
+      }).catch(() => {});
+    // create a single audio element for queue
+    audioRef.current = new Audio();
+    audioRef.current.addEventListener('ended', () => {
+      playingRef.current = false;
+      playNextInQueue();
+    });
   }, []);
 
-  // ---- Connect SSE ONCE (voice changes won’t reconnect) ----
+  // subscribe to SSE stream
   useEffect(() => {
     if (!code) return;
-
     const es = new EventSource(`/api/stream?code=${encodeURIComponent(code)}`);
-    esRef.current = es;
+    es.onmessage = async (e) => {
+      const msg = JSON.parse(e.data || '{}'); // { ts, en }
+      const ts = msg.ts || Date.now();
+      const english = (msg.en || '').trim();
+      if (!english) return;
 
-    const onChunk = (e) => {
-      try {
-        const msg = JSON.parse(e.data);   // { ts, en }
-        if (!msg?.ts) return;
-        if (msg.ts <= lastSeenTsRef.current) return; // ignore historical lines
-        lastSeenTsRef.current = msg.ts;
+      // translate on-demand for each listener’s chosen language
+      let outText = english;
+      if (lang && lang !== 'en') {
+        try {
+          const r = await fetch('/api/translate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: english, to: lang }),
+          });
+          if (r.ok) {
+            const j = await r.json();
+            outText = (j?.text || english).trim();
+          }
+        } catch {
+          // fallback to English if translation fails
+          outText = english;
+        }
+      }
 
-        const spoken = (msg.en || '').trim();
-        if (!spoken) return;
+      // render the line
+      setLines((prev) => [...prev, { ts, text: outText }].slice(-400));
 
-        // keep readable transcript
-        setLines((prev) => [...prev, { ts: msg.ts, text: spoken }].slice(-300));
-
-        // speech pipeline
-        processSpoken(spoken);
-      } catch {}
-    };
-
-    es.onmessage = onChunk;
-
-    es.addEventListener('end', () => {
-      es.close();
-      flushNow(); // flush whatever remains as a final thought
-    });
-
-    return () => {
-      es.close();
-      esRef.current = null;
-      clearTimeout(flushTimerRef.current);
-      bufferRef.current = '';
-      ttsQueueRef.current = [];
-      playingRef.current  = false;
-      if (audioRef.current) {
-        try { audioRef.current.pause(); } catch {}
-        audioRef.current = null;
+      // queue speech (only for *new* line, never replay old ones)
+      if (speakEnabled && voiceId && outText) {
+        enqueueTTS(outText);
       }
     };
-    // IMPORTANT: do NOT include voiceId here, or we’ll reconnect + replay history
-  }, [code, speakEnabled]);
+    es.addEventListener('end', () => es.close());
+    return () => es.close();
+  }, [code, speakEnabled, voiceId, lang]); // re-subscribe if these change
 
-  // ---- Process mic chunk text into a buffered "thought" ----
-  function processSpoken(raw) {
-    const now = Date.now();
-    lastMsgAtRef.current = now;
-
-    // discard fillers
-    if (THROWAWAY.test(raw)) return;
-
-    // merge “2, 3” etc. into previous clause
-    if (NUMBERS_ONLY.test(raw)) {
-      const cur = bufferRef.current.trim();
-      if (cur) {
-        bufferRef.current = (cur + ' ' + raw).replace(/\s+/g, ' ').trim();
-      } else {
-        bufferRef.current = raw.trim();
-      }
-    } else {
-      bufferRef.current = (bufferRef.current + ' ' + raw).replace(/\s+/g, ' ').trim();
-    }
-
-    // (re)start a silence timer to flush after a gap
-    clearTimeout(flushTimerRef.current);
-    flushTimerRef.current = window.setTimeout(() => {
-      // only flush if we truly had no new text during the gap
-      if (Date.now() - lastMsgAtRef.current >= FLUSH_GAP_MS) {
-        flushNow();
-      }
-    }, FLUSH_GAP_MS);
-
-    // flush immediately if sentence-like end, or phrase is long, or soft-ender
-    if (TERMINATORS.test(bufferRef.current) ||
-        bufferRef.current.length >= MAX_PHRASE_LEN ||
-        endsWithSoftEnder(bufferRef.current)) {
-      flushNow();
-    }
+  function enqueueTTS(text) {
+    queueRef.current.push({ text });
+    if (!playingRef.current) playNextInQueue();
   }
 
-  function endsWithSoftEnder(s) {
-    const t = s.toLowerCase().trim().replace(/[.?!…]+$/, '');
-    return SOFT_ENDERS.some(end => t.endsWith(end));
-  }
+  async function playNextInQueue() {
+    if (playingRef.current) return;
+    const item = queueRef.current.shift();
+    if (!item) return;
 
-  function flushNow() {
-    clearTimeout(flushTimerRef.current);
-    const text = finalize(bufferRef.current);
-    bufferRef.current = '';
-    if (!text) return;
-    if (speakEnabled) enqueueTTS(text, voiceRef.current);
-  }
-
-  // normalize sentence: punctuation spacing, ensure an ending dot
-  function finalize(s) {
-    let out = (s || '').replace(/\s+/g, ' ').trim();
-    if (!out) return '';
-    out = out.replace(/\s*,\s*/g, ', ').replace(/\s+([.!?…])/g, '$1');
-    if (!TERMINATORS.test(out)) out += '.';
-    return out;
-  }
-
-  /** ---------- TTS queue: strict one-at-a-time playback ---------- */
-  function enqueueTTS(text, vid) {
-    if (!text?.trim() || !vid) return;
-    const q = ttsQueueRef.current;
-    if (q.length && q[q.length - 1].text === text) return; // drop immediate dup
-    q.push({ text, voiceId: vid });
-    if (!playingRef.current) playNext();
-  }
-
-  async function playNext() {
-    const q = ttsQueueRef.current;
-    if (!q.length) { playingRef.current = false; return; }
     playingRef.current = true;
-
-    const { text, voiceId: vid } = q.shift();
     try {
-      const res = await fetch('/api/tts', {
+      const r = await fetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, voiceId: vid, modelId: 'eleven_flash_v2_5' }),
+        body: JSON.stringify({
+          text: item.text,
+          voiceId,
+          modelId: 'eleven_flash_v2_5', // cost-effective, good quality
+        }),
       });
-      if (!res.ok) throw new Error('TTS failed');
-      const ab = await res.arrayBuffer();
+      if (!r.ok) throw new Error('tts failed');
+      const ab = await r.arrayBuffer();
       const blob = new Blob([ab], { type: 'audio/mpeg' });
-
-      if (!audioRef.current) audioRef.current = new Audio();
-      const a = audioRef.current;
-      a.src = URL.createObjectURL(blob);
-
-      await a.play().catch(() => {});
-      await waitForEnd(a);
-    } catch {
-      // swallow & continue
-    } finally {
-      playNext();
-    }
-  }
-
-  function waitForEnd(audio) {
-    return new Promise((resolve) => {
-      const done = () => { audio.removeEventListener('ended', done); resolve(); };
-      audio.addEventListener('ended', done, { once: true });
-    });
-  }
-
-  // If user disables Speak, clear pending audio immediately
-  useEffect(() => {
-    if (!speakEnabled) {
-      ttsQueueRef.current = [];
-      if (audioRef.current) {
-        try { audioRef.current.pause(); } catch {}
-      }
+      const url = URL.createObjectURL(blob);
+      audioRef.current.src = url;
+      audioRef.current.play().catch(() => {
+        // autoplay can be blocked until user gesture
+        playingRef.current = false;
+      });
+    } catch (e) {
       playingRef.current = false;
     }
-  }, [speakEnabled]);
+  }
 
-  const rendered = useMemo(() => lines, [lines]);
-
-  /** ---------------- UI ---------------- */
   return (
     <main style={{ minHeight: '100vh', padding: 24, color: 'white', background: 'linear-gradient(135deg,#0e1a2b,#153a74 60%,#0f3070)' }}>
       <div style={{ maxWidth: 980, margin: '0 auto' }}>
@@ -227,15 +169,22 @@ export default function ListenerPage({ params }) {
         <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
           <div>Session: <code>{code}</code></div>
 
-          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-            <input type="checkbox" checked={speakEnabled} onChange={(e) => setSpeakEnabled(e.target.checked)} />
-            <span>Speak</span>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            My language:
+            <select value={lang} onChange={(e) => setLang(e.target.value)} style={{ padding: 6, borderRadius: 8 }}>
+              {LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
+            </select>
           </label>
 
-          <label>
-            <span style={{ marginRight: 6 }}>Voice:</span>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <input type="checkbox" checked={speakEnabled} onChange={(e) => setSpeakEnabled(e.target.checked)} />
+            🗣️ Speak
+          </label>
+
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            Voice:
             <select value={voiceId || ''} onChange={(e) => setVoiceId(e.target.value)} style={{ padding: 6, borderRadius: 8 }}>
-              {voices.map(v => (
+              {voices.map((v) => (
                 <option key={v.voice_id} value={v.voice_id}>{v.name || v.voice_id}</option>
               ))}
             </select>
@@ -243,10 +192,10 @@ export default function ListenerPage({ params }) {
         </div>
 
         <div style={{ background: '#0b1220', color: 'white', padding: 16, borderRadius: 10, marginTop: 16 }}>
-          {rendered.map((l) => (
-            <div key={l.ts} style={{ marginBottom: 10 }}>
+          {lines.map((l, i) => (
+            <div key={l.ts + '-' + i} style={{ marginBottom: 10 }}>
               <div style={{ opacity: 0.6, fontSize: 12 }}>{new Date(l.ts).toLocaleTimeString()}</div>
-              <div>🗣️ {l.text}</div>
+              <div>🗨️ {l.text}</div>
             </div>
           ))}
         </div>
