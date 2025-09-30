@@ -2,10 +2,21 @@
 
 import { useEffect, useRef, useState } from 'react';
 
-// -------- knobs --------
-const SEG_MS = 5000;          // record finalized 5s segments
-const MIN_SEND_B = 6000;      // drop tiny blobs
-// -----------------------
+/**
+ * We keep translations server-side, but the Operator UI no longer shows or edits them.
+ * This CSV is sent quietly with each audio segment so listeners can pick any of these.
+ * (You can trim this list later if you want to save tokens.)
+ */
+const LANGS_CSV =
+  [
+    'af','ar','bg','ca','cs','da','de','el','en','es','et','fa','fi','fr','he','hi','hr','hu','id','it',
+    'ja','ko','lt','lv','ms','nl','no','pl','pt','pt-BR','ro','ru','sk','sl','sr','sv','sw','ta','th',
+    'tr','uk','ur','vi','zh','zh-TW','bn','fil','gu','kn','ml','mr'
+  ].join(',');
+
+// mic/recording knobs
+const SEG_MS = 5000;      // record finalized 5s segments
+const MIN_SEND_B = 6000;  // drop tiny blobs
 
 const INPUT_LANGS = [
   { code: 'AUTO', label: 'Auto-detect (Whisper)' },
@@ -13,23 +24,24 @@ const INPUT_LANGS = [
   { code: 'en-GB', label: 'English (United Kingdom)' },
   { code: 'en-AU', label: 'English (Australia)' },
   { code: 'en-CA', label: 'English (Canada)' },
-  { code: 'es-US', label: 'Spanish (United States)' },
   { code: 'es-ES', label: 'Spanish (Spain)' },
   { code: 'es-MX', label: 'Spanish (Mexico)' },
+  { code: 'es-US', label: 'Spanish (United States)' },
   { code: 'vi-VN', label: 'Vietnamese (Vietnam)' },
+  { code: 'zh-CN', label: 'Chinese (Simplified)' },
+  { code: 'zh-TW', label: 'Chinese (Traditional)' },
 ];
 
 export default function Operator() {
   const [code, setCode] = useState(null);
   const [inputLang, setInputLang] = useState('AUTO');
-  const [langsCsv, setLangsCsv] = useState('es,vi,zh');
   const [running, setRunning] = useState(false);
-  const [log, setLog] = useState([]);
+  const [log, setLog] = useState([]); // preview of the SPOKEN text only
 
   // media + recorder
   const mediaRef = useRef(null);
-  const recRef = useRef(null);
-  const runningRef = useRef(false); // used inside callbacks
+  const recRef   = useRef(null);
+  const runningRef = useRef(false);
 
   // URLs
   const origin = typeof window !== 'undefined' ? window.location.origin : 'https://onevoice.church';
@@ -43,23 +55,22 @@ export default function Operator() {
     if (typeof window === 'undefined') return;
     setCode(localStorage.getItem('ov:lastCode') || Math.random().toString(36).slice(2, 6).toUpperCase());
     setInputLang(localStorage.getItem('ov:inputLang') || 'AUTO');
-    setLangsCsv(localStorage.getItem('ov:langs') || 'es,vi,zh');
   }, []);
   useEffect(() => {
     if (typeof window === 'undefined') return;
     if (code) localStorage.setItem('ov:lastCode', code);
     localStorage.setItem('ov:inputLang', inputLang);
-    localStorage.setItem('ov:langs', langsCsv);
-  }, [code, inputLang, langsCsv]);
+  }, [code, inputLang]);
 
-  // live preview via SSE
+  // live preview via SSE (ENGLISH / SPOKEN ONLY)
   useEffect(() => {
     if (!code) return;
     const es = new EventSource(`/api/stream?code=${encodeURIComponent(code)}`);
     es.onmessage = (e) => {
       try {
         const line = JSON.parse(e.data);
-        setLog((prev) => [...prev, line].slice(-200));
+        // Only show the source speech (server stores it as .en whatever the actual input language is)
+        setLog((prev) => [...prev, { ts: line.ts, text: line.en }].slice(-200));
       } catch {}
     };
     es.addEventListener('end', () => es.close());
@@ -86,11 +97,11 @@ export default function Operator() {
     });
     mediaRef.current = stream;
 
-    // safest mime choices; we’ll let the browser pick the first it supports
     const mimeType =
       MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' :
       MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' :
-      MediaRecorder.isTypeSupported('audio/ogg;codecs=opus') ? 'audio/ogg;codecs=opus' : '';
+      MediaRecorder.isTypeSupported('audio/ogg;codecs=opus') ? 'audio/ogg;codecs=opus' :
+      '';
 
     runningRef.current = true;
     setRunning(true);
@@ -107,7 +118,8 @@ export default function Operator() {
           const qs = new URLSearchParams({
             code: code || '',
             inputLang,
-            langs: (langsCsv || 'es').replace(/\s+/g, ''),
+            // Operator no longer edits langs; we always ask the server to prep a big set for listeners
+            langs: LANGS_CSV,
           });
           const ab = await e.data.arrayBuffer();
           await fetch('/api/ingest?' + qs.toString(), {
@@ -128,11 +140,10 @@ export default function Operator() {
       };
       recorder.onstop = () => {
         window.clearTimeout(segTimer);
-        // immediately roll to next segment while mic stays open
         if (runningRef.current) startRecorder();
       };
 
-      recorder.start(); // no timeslice; we stop after SEG_MS
+      recorder.start();
     };
 
     startRecorder();
@@ -148,13 +159,11 @@ export default function Operator() {
     }
   }
 
-  const firstLang = (langsCsv || 'es').split(',')[0].trim() || 'es';
-
   return (
     <main style={{ minHeight: '100vh', padding: 24, color: 'white', background: 'linear-gradient(135deg,#0e1a2b,#153a74 60%,#0f3070)' }}>
       <div style={{ maxWidth: 960, margin: '0 auto' }}>
         <h1>🎚️ Operator Console (Whisper)</h1>
-        <p style={{ opacity: 0.9 }}>Share the code/QR. Set input language (or Auto). Choose target languages (csv). Start the mic.</p>
+        <p style={{ opacity: 0.9 }}>Share the code/QR. Pick input language (or Auto). Start the mic.</p>
 
         {code && (
           <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 16, alignItems: 'center' }}>
@@ -182,16 +191,6 @@ export default function Operator() {
             </select>
           </label>
 
-          <label>
-            <span style={{ marginRight: 8 }}>Offer languages (csv):</span>
-            <input
-              value={langsCsv}
-              onChange={(e) => setLangsCsv(e.target.value)}
-              placeholder="es,vi,zh"
-              style={{ padding: 8, borderRadius: 8, width: 240 }}
-            />
-          </label>
-
           {!running ? (
             <button onClick={startMic} style={{ padding: '8px 12px', borderRadius: 8, border: 'none', fontWeight: 700, cursor: 'pointer' }}>
               🎙️ Mic ON
@@ -207,13 +206,12 @@ export default function Operator() {
           </button>
         </div>
 
-        <h3 style={{ marginTop: 18 }}>Live Preview</h3>
-        <div style={{ background: '#0b1220', color: 'white', padding: 12, borderRadius: 8, minHeight: 180, lineHeight: 1.6 }}>
+        <h3 style={{ marginTop: 18 }}>Live Preview (spoken text)</h3>
+        <div style={{ background: '#0b1220', color: 'white', padding: 12, borderRadius: 8, minHeight: 220, lineHeight: 1.6 }}>
           {log.map((l) => (
             <div key={l.ts + Math.random()} style={{ marginBottom: 10 }}>
               <div style={{ opacity: 0.6, fontSize: 12 }}>{new Date(l.ts).toLocaleTimeString()}</div>
-              <div>🗣️ {l.en}</div>
-              <div>🌍 {l.tx?.[firstLang]}</div>
+              <div>🗣️ {l.text}</div>
             </div>
           ))}
         </div>
