@@ -2,7 +2,6 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-// 50-ish language options matching the keys generated on the server
 const LANG_OPTIONS = [
   ['en','English'], ['es','Spanish'], ['vi','Vietnamese'], ['zh','Chinese (Simplified)'], ['zh-TW','Chinese (Traditional)'],
   ['ar','Arabic'], ['bg','Bulgarian'], ['ca','Catalan'], ['cs','Czech'], ['da','Danish'], ['de','German'], ['el','Greek'],
@@ -15,7 +14,10 @@ const LANG_OPTIONS = [
   ['kn','Kannada'], ['ml','Malayalam'], ['mr','Marathi']
 ];
 
-const VOICE_CHOICES = ['Alloy','Samantha','Daniel','Victoria','Google español','Microsoft Sabina','Google हिन्दी','Google 日本語'];
+// keep using the browser voices (no API cost)
+const USE_SERVER_TTS = false;
+
+const VOICE_CHOICES = ['Alloy','Samantha','Daniel','Victoria','Microsoft Sabina','Google español','Google हिन्दी','Google 日本語'];
 
 export default function Listener({ params }) {
   const code = params.code;
@@ -25,27 +27,45 @@ export default function Listener({ params }) {
   const [voiceName, setVoiceName] = useState(() => localStorage.getItem('ov:voiceName') || 'Alloy');
   const [lines, setLines] = useState([]);
 
-  // speech
+  // speech: browser synthesis
   const voicesRef = useRef([]);
-  const utterQ = useRef([]); // queue of strings to speak
-  const speakingRef = useRef(false);
+  const utterQ = useRef([]);         // queue of strings to speak
+  const speakingRef = useRef(false); // lock
+
+  // speech: server TTS audio queue (only used if USE_SERVER_TTS = true)
+  const audioQ = useRef([]);
+  const playingRef = useRef(false);
 
   useEffect(() => { localStorage.setItem('ov:viewerLang', lang); }, [lang]);
   useEffect(() => { localStorage.setItem('ov:speak', speak ? '1' : '0'); }, [speak]);
   useEffect(() => { localStorage.setItem('ov:voiceName', voiceName); }, [voiceName]);
 
-  // subscribe to server events
+  // SSE subscription
   useEffect(() => {
     const es = new EventSource(`/api/stream?code=${encodeURIComponent(code)}`);
     es.onmessage = (e) => {
       try {
         const line = JSON.parse(e.data);
         setLines((prev) => [...prev, line].slice(-200));
-        if (speak) {
-          const text = line.tx?.[lang] || line.en || '';
-          if (text) {
+
+        const text = line.tx?.[lang] || line.en || '';
+        if (speak && text) {
+          if (USE_SERVER_TTS) {
+            // fetch audio from server TTS
+            fetch('/api/tts', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text, voice: voiceName, lang })
+            })
+              .then(r => r.ok ? r.arrayBuffer() : Promise.reject())
+              .then(buf => {
+                audioQ.current.push(new Blob([buf], { type: 'audio/mpeg' }));
+                pumpServerAudio();
+              })
+              .catch(() => {});
+          } else {
             utterQ.current.push(text);
-            pumpSpeech();
+            pumpBrowserSpeech();
           }
         }
       } catch {}
@@ -53,13 +73,15 @@ export default function Listener({ params }) {
     es.addEventListener('end', () => es.close());
     return () => es.close();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [code, lang, speak]);
+  }, [code, lang, speak, voiceName]);
 
-  // load voices (Web Speech API)
+  // browser voices
   useEffect(() => {
-    const load = () => { voicesRef.current = window.speechSynthesis.getVoices() || []; };
-    load();
-    window.speechSynthesis.onvoiceschanged = load;
+    if (!USE_SERVER_TTS) {
+      const load = () => { voicesRef.current = window.speechSynthesis.getVoices() || []; };
+      load();
+      window.speechSynthesis.onvoiceschanged = load;
+    }
   }, []);
 
   function pickVoice() {
@@ -68,7 +90,8 @@ export default function Listener({ params }) {
     return found || vs[0] || null;
   }
 
-  function pumpSpeech() {
+  function pumpBrowserSpeech() {
+    if (USE_SERVER_TTS) return;
     if (speakingRef.current) return;
     if (!utterQ.current.length) return;
     const txt = utterQ.current.shift();
@@ -95,9 +118,29 @@ export default function Listener({ params }) {
     speakingRef.current = true;
     u.onend = () => {
       speakingRef.current = false;
-      pumpSpeech();
+      pumpBrowserSpeech();
     };
     window.speechSynthesis.speak(u);
+  }
+
+  // play queued <audio> blobs (server TTS) sequentially
+  function pumpServerAudio() {
+    if (!USE_SERVER_TTS) return;
+    if (playingRef.current) return;
+    if (!audioQ.current.length) return;
+
+    const blob = audioQ.current.shift();
+    const url = URL.createObjectURL(blob);
+    const a = new Audio(url);
+    playingRef.current = true;
+    a.onended = () => {
+      playingRef.current = false;
+      URL.revokeObjectURL(url);
+      pumpServerAudio();
+    };
+    a.play().catch(() => {
+      playingRef.current = false;
+    });
   }
 
   const latest = useMemo(() => lines[lines.length - 1], [lines]);
