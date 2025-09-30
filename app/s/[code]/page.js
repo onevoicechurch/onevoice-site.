@@ -1,191 +1,82 @@
 'use client';
+import { useEffect, useState } from 'react';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+export default function ListenerPage({ params }) {
+  const [voices, setVoices] = useState([]);
+  const [selectedVoice, setSelectedVoice] = useState(null);
+  const [speakEnabled, setSpeakEnabled] = useState(true);
 
-const LANG_OPTIONS = [
-  ['en','English'], ['es','Spanish'], ['vi','Vietnamese'], ['zh','Chinese (Simplified)'], ['zh-TW','Chinese (Traditional)'],
-  ['ar','Arabic'], ['bg','Bulgarian'], ['ca','Catalan'], ['cs','Czech'], ['da','Danish'], ['de','German'], ['el','Greek'],
-  ['et','Estonian'], ['fa','Persian'], ['fi','Finnish'], ['fr','French'], ['he','Hebrew'], ['hi','Hindi'], ['hr','Croatian'],
-  ['hu','Hungarian'], ['id','Indonesian'], ['it','Italian'], ['ja','Japanese'], ['ko','Korean'], ['lt','Lithuanian'],
-  ['lv','Latvian'], ['ms','Malay'], ['nl','Dutch'], ['no','Norwegian'], ['pl','Polish'], ['pt','Portuguese'],
-  ['pt-BR','Portuguese (Brazil)'], ['ro','Romanian'], ['ru','Russian'], ['sk','Slovak'], ['sl','Slovenian'],
-  ['sr','Serbian'], ['sv','Swedish'], ['sw','Swahili'], ['ta','Tamil'], ['th','Thai'], ['tr','Turkish'],
-  ['uk','Ukrainian'], ['ur','Urdu'], ['af','Afrikaans'], ['bn','Bengali'], ['fil','Filipino'], ['gu','Gujarati'],
-  ['kn','Kannada'], ['ml','Malayalam'], ['mr','Marathi']
-];
-
-// keep using the browser voices (no API cost)
-const USE_SERVER_TTS = false;
-
-const VOICE_CHOICES = ['Alloy','Samantha','Daniel','Victoria','Microsoft Sabina','Google español','Google हिन्दी','Google 日本語'];
-
-export default function Listener({ params }) {
-  const code = params.code;
-
-  const [lang, setLang] = useState(() => localStorage.getItem('ov:viewerLang') || 'es');
-  const [speak, setSpeak] = useState(() => localStorage.getItem('ov:speak') === '1');
-  const [voiceName, setVoiceName] = useState(() => localStorage.getItem('ov:voiceName') || 'Alloy');
-  const [lines, setLines] = useState([]);
-
-  // speech: browser synthesis
-  const voicesRef = useRef([]);
-  const utterQ = useRef([]);         // queue of strings to speak
-  const speakingRef = useRef(false); // lock
-
-  // speech: server TTS audio queue (only used if USE_SERVER_TTS = true)
-  const audioQ = useRef([]);
-  const playingRef = useRef(false);
-
-  useEffect(() => { localStorage.setItem('ov:viewerLang', lang); }, [lang]);
-  useEffect(() => { localStorage.setItem('ov:speak', speak ? '1' : '0'); }, [speak]);
-  useEffect(() => { localStorage.setItem('ov:voiceName', voiceName); }, [voiceName]);
-
-  // SSE subscription
+  // Load available voices from our backend API
   useEffect(() => {
-    const es = new EventSource(`/api/stream?code=${encodeURIComponent(code)}`);
-    es.onmessage = (e) => {
-      try {
-        const line = JSON.parse(e.data);
-        setLines((prev) => [...prev, line].slice(-200));
-
-        const text = line.tx?.[lang] || line.en || '';
-        if (speak && text) {
-          if (USE_SERVER_TTS) {
-            // fetch audio from server TTS
-            fetch('/api/tts', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ text, voice: voiceName, lang })
-            })
-              .then(r => r.ok ? r.arrayBuffer() : Promise.reject())
-              .then(buf => {
-                audioQ.current.push(new Blob([buf], { type: 'audio/mpeg' }));
-                pumpServerAudio();
-              })
-              .catch(() => {});
-          } else {
-            utterQ.current.push(text);
-            pumpBrowserSpeech();
-          }
+    fetch('/api/voices')
+      .then((res) => res.json())
+      .then((data) => {
+        setVoices(data.voices || []);
+        if (data.voices?.length) {
+          setSelectedVoice(data.voices[0].voice_id);
         }
-      } catch {}
-    };
-    es.addEventListener('end', () => es.close());
-    return () => es.close();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [code, lang, speak, voiceName]);
-
-  // browser voices
-  useEffect(() => {
-    if (!USE_SERVER_TTS) {
-      const load = () => { voicesRef.current = window.speechSynthesis.getVoices() || []; };
-      load();
-      window.speechSynthesis.onvoiceschanged = load;
-    }
+      });
   }, []);
 
-  function pickVoice() {
-    const vs = voicesRef.current;
-    const found = vs.find(v => v.name.toLowerCase().includes(voiceName.toLowerCase()));
-    return found || vs[0] || null;
+  async function playTTS(text) {
+    if (!speakEnabled || !selectedVoice) return;
+
+    try {
+      const res = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text,
+          voiceId: selectedVoice,
+          modelId: 'eleven_flash_v2_5', // use Flash for cheaper, real-time TTS
+        }),
+      });
+
+      if (!res.ok) throw new Error('TTS request failed');
+
+      const audioBuffer = await res.arrayBuffer();
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const decoded = await audioCtx.decodeAudioData(audioBuffer);
+      const source = audioCtx.createBufferSource();
+      source.buffer = decoded;
+      source.connect(audioCtx.destination);
+      source.start(0);
+    } catch (err) {
+      console.error('TTS error', err);
+    }
   }
-
-  function pumpBrowserSpeech() {
-    if (USE_SERVER_TTS) return;
-    if (speakingRef.current) return;
-    if (!utterQ.current.length) return;
-    const txt = utterQ.current.shift();
-
-    const u = new SpeechSynthesisUtterance(txt);
-    const v = pickVoice();
-    if (v) u.voice = v;
-
-    // language hint (best effort)
-    if (lang.startsWith('es')) u.lang = 'es-ES';
-    else if (lang.startsWith('pt-BR')) u.lang = 'pt-BR';
-    else if (lang.startsWith('pt')) u.lang = 'pt-PT';
-    else if (lang.startsWith('vi')) u.lang = 'vi-VN';
-    else if (lang.startsWith('zh-TW')) u.lang = 'zh-TW';
-    else if (lang.startsWith('zh')) u.lang = 'zh-CN';
-    else if (lang.startsWith('ja')) u.lang = 'ja-JP';
-    else if (lang.startsWith('ko')) u.lang = 'ko-KR';
-    else if (lang.startsWith('fr')) u.lang = 'fr-FR';
-    else if (lang.startsWith('de')) u.lang = 'de-DE';
-    else if (lang.startsWith('ar')) u.lang = 'ar-SA';
-
-    u.rate = 1.0;
-    u.pitch = 1.0;
-    speakingRef.current = true;
-    u.onend = () => {
-      speakingRef.current = false;
-      pumpBrowserSpeech();
-    };
-    window.speechSynthesis.speak(u);
-  }
-
-  // play queued <audio> blobs (server TTS) sequentially
-  function pumpServerAudio() {
-    if (!USE_SERVER_TTS) return;
-    if (playingRef.current) return;
-    if (!audioQ.current.length) return;
-
-    const blob = audioQ.current.shift();
-    const url = URL.createObjectURL(blob);
-    const a = new Audio(url);
-    playingRef.current = true;
-    a.onended = () => {
-      playingRef.current = false;
-      URL.revokeObjectURL(url);
-      pumpServerAudio();
-    };
-    a.play().catch(() => {
-      playingRef.current = false;
-    });
-  }
-
-  const latest = useMemo(() => lines[lines.length - 1], [lines]);
-  const shown = latest ? (latest.tx?.[lang] || latest.en || '') : '';
 
   return (
-    <main style={{ minHeight: '100vh', padding: 24, color: 'white', background: 'linear-gradient(135deg,#0e1a2b,#153a74 60%,#0f3070)' }}>
-      <div style={{ maxWidth: 880, margin: '0 auto' }}>
-        <h1>OneVoice — Live Captions</h1>
-        <div style={{ margin: '8px 0 16px', opacity: 0.9 }}>
-          <span style={{ marginRight: 12 }}>Session: <code>{code}</code></span>
-          <label style={{ marginRight: 8 }}>My language:{' '}
-            <select value={lang} onChange={(e) => setLang(e.target.value)}>
-              {LANG_OPTIONS.map(([value, label]) => (
-                <option key={value} value={value}>{label}</option>
-              ))}
-            </select>
-          </label>
-          <label style={{ marginRight: 8 }}>
-            🗣️ Speak{' '}
-            <input type="checkbox" checked={speak} onChange={(e) => setSpeak(e.target.checked)} />
-          </label>
-          <label>
-            Voice:{' '}
-            <select value={voiceName} onChange={(e) => setVoiceName(e.target.value)}>
-              {VOICE_CHOICES.map(n => <option key={n} value={n}>{n}</option>)}
-            </select>
-          </label>
-        </div>
+    <div className="p-6 text-white">
+      <h1 className="text-xl font-bold mb-4">OneVoice — Live Captions</h1>
 
-        <div style={{ background: '#0b1220', borderRadius: 8, padding: 16, minHeight: 260, lineHeight: 1.6 }}>
-          {lines.length === 0 ? (
-            <div style={{ opacity: 0.7 }}>Waiting for captions…</div>
-          ) : (
-            <>
-              <div style={{ fontSize: 22, marginBottom: 12 }}>{shown}</div>
-              <div style={{ opacity: 0.8, fontSize: 14 }}>
-                {lines.slice(-12).map((l) => (
-                  <div key={l.ts}>{new Date(l.ts).toLocaleTimeString()} — {l.tx?.[lang] || l.en}</div>
-                ))}
-              </div>
-            </>
-          )}
-        </div>
+      <label className="mr-2">Voice:</label>
+      <select
+        value={selectedVoice || ''}
+        onChange={(e) => setSelectedVoice(e.target.value)}
+        className="text-black p-1 rounded"
+      >
+        {voices.map((v) => (
+          <option key={v.voice_id} value={v.voice_id}>
+            {v.name}
+          </option>
+        ))}
+      </select>
+
+      <label className="ml-4">
+        <input
+          type="checkbox"
+          checked={speakEnabled}
+          onChange={() => setSpeakEnabled(!speakEnabled)}
+          className="mr-1"
+        />
+        Speak
+      </label>
+
+      <div id="captions" className="mt-6 p-4 bg-black/40 rounded">
+        {/* TODO: plug in your websocket/subscription feed here so every line of translated text calls playTTS */}
+        <p className="opacity-50">Waiting for captions…</p>
       </div>
-    </main>
+    </div>
   );
 }
