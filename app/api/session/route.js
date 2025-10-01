@@ -1,21 +1,27 @@
-import { NextResponse } from 'next/server';
-import { createSession, endSession } from '../_lib/sessionStore';
-
 export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
+
+import { NextResponse } from 'next/server';
+import { createSession, endSession, setInputLang } from '../_lib/sessionStore';
 
 export async function POST(req) {
-  const body = await req.json().catch(() => ({}));
-  const provided = typeof body?.code === 'string' ? body.code.trim().toUpperCase() : null;
-  const code = provided || Math.random().toString(36).slice(2, 6).toUpperCase();
-  await createSession(code);
+  const body = await req.json().catch(()=> ({}));
+  const inputLang = body?.inputLang || 'AUTO';
+  const code = await createSession(inputLang);
   return NextResponse.json({ ok: true, code });
 }
 
 export async function DELETE(req) {
-  const u = new URL(req.url);
-  const code = (u.searchParams.get('code') || '').toUpperCase();
-  if (!code) return NextResponse.json({ ok: false, error: 'missing code' }, { status: 400 });
+  const { searchParams } = new URL(req.url);
+  const code = searchParams.get('code');
+  if (!code) return NextResponse.json({ ok:false, error:'Missing code' }, { status:400 });
   await endSession(code);
-  return NextResponse.json({ ok: true });
+  return NextResponse.json({ ok:true });
+}
+
+export async function PATCH(req){
+  const body = await req.json().catch(()=> ({}));
+  const { code, inputLang } = body || {};
+  if (!code || !inputLang) return NextResponse.json({ ok:false, error:'Missing code/inputLang' }, { status:400 });
+  await setInputLang(code, inputLang);
+  return NextResponse.json({ ok:true });
 }
