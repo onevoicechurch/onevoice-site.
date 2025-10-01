@@ -1,27 +1,33 @@
-import { NextResponse } from 'next/server';
-import OpenAI from 'openai';
-
 export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+import { NextResponse } from 'next/server';
 
-// Simple, low-latency translator. You can swap to a dedicated MT model later.
 export async function POST(req) {
-  try {
-    const { text, target } = await req.json();
-    if (!text || !target) {
-      return NextResponse.json({ ok: false, error: 'missing text/target' }, { status: 400 });
-    }
-    const r = await openai.responses.create({
+  const { text, targetLang } = await req.json().catch(()=> ({}));
+  if (!text || !targetLang) return NextResponse.json({ ok:false, error:'Missing text/targetLang' }, { status:400 });
+
+  const sys = `You are a professional live interpreter. Translate into ${targetLang} with natural, conversational phrasing. Do not add comments.`;
+  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+    method:'POST',
+    headers:{
+      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
       model: 'gpt-4o-mini',
-      input: `Translate to ${target}:\n\n${text}\n\nReturn only the translation.`,
-      temperature: 0,
-    });
-    const out = r.output_text?.trim() || '';
-    return NextResponse.json({ ok: true, text: out });
-  } catch (e) {
-    console.error('translate error', e);
-    return NextResponse.json({ ok: false, error: 'translate_failed' }, { status: 500 });
+      temperature: 0.2,
+      messages: [
+        { role:'system', content: sys },
+        { role:'user', content: text }
+      ]
+    })
+  });
+
+  if (!resp.ok) {
+    const t = await resp.text().catch(()=> '');
+    return NextResponse.json({ ok:false, error:`openai-${resp.status}`, body:t }, { status:502 });
   }
+  const data = await resp.json().catch(()=> ({}));
+  const out = data?.choices?.[0]?.message?.content?.trim() || '';
+  return NextResponse.json({ ok:true, text: out });
 }
