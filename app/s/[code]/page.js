@@ -1,156 +1,130 @@
 'use client';
+
 import { useEffect, useRef, useState } from 'react';
 
-// 50ish common options (label -> target string sent to translator)
 const LANGS = [
-  ['Auto (original)', 'orig'],
-  ['English', 'English'],
-  ['Spanish', 'Spanish'],
-  ['Portuguese (Brazil)', 'Portuguese (Brazil)'],
-  ['French', 'French'],
-  ['German', 'German'],
-  ['Italian', 'Italian'],
-  ['Dutch', 'Dutch'],
-  ['Swedish', 'Swedish'],
-  ['Norwegian', 'Norwegian'],
-  ['Danish', 'Danish'],
-  ['Finnish', 'Finnish'],
-  ['Polish', 'Polish'],
-  ['Czech', 'Czech'],
-  ['Slovak', 'Slovak'],
-  ['Romanian', 'Romanian'],
-  ['Hungarian', 'Hungarian'],
-  ['Greek', 'Greek'],
-  ['Russian', 'Russian'],
-  ['Ukrainian', 'Ukrainian'],
-  ['Turkish', 'Turkish'],
-  ['Arabic', 'Arabic'],
-  ['Hebrew', 'Hebrew'],
-  ['Persian (Farsi)', 'Persian'],
-  ['Hindi', 'Hindi'],
-  ['Urdu', 'Urdu'],
-  ['Bengali', 'Bengali'],
-  ['Tamil', 'Tamil'],
-  ['Telugu', 'Telugu'],
-  ['Malayalam', 'Malayalam'],
-  ['Kannada', 'Kannada'],
-  ['Marathi', 'Marathi'],
-  ['Gujarati', 'Gujarati'],
-  ['Punjabi', 'Punjabi'],
-  ['Thai', 'Thai'],
-  ['Vietnamese', 'Vietnamese'],
-  ['Indonesian', 'Indonesian'],
-  ['Malay', 'Malay'],
-  ['Filipino (Tagalog)', 'Filipino'],
-  ['Chinese (Simplified)', 'Chinese (Simplified)'],
-  ['Chinese (Traditional)', 'Chinese (Traditional)'],
-  ['Japanese', 'Japanese'],
-  ['Korean', 'Korean'],
-  ['Swahili', 'Swahili'],
-  ['Amharic', 'Amharic'],
-  ['Yoruba', 'Yoruba'],
-  ['Igbo', 'Igbo'],
-  ['Zulu', 'Zulu'],
-  ['Xhosa', 'Xhosa'],
-  ['Haitian Creole', 'Haitian Creole'],
+  { v:'en', label:'English' },
+  { v:'es', label:'Spanish' },
+  { v:'pt', label:'Portuguese' },
+  { v:'fr', label:'French' },
+  { v:'de', label:'German' }
 ];
 
-export default function ListenerPage({ params }) {
-  const code = (params?.code || '').toString().toUpperCase();
-  const [lang, setLang] = useState('orig');
-  const [log, setLog] = useState([]);                // source lines
-  const [view, setView] = useState([]);              // rendered lines (translated or original)
-  const cursorRef = useRef(0);
-  const cache = useRef(new Map());                   // key: `${ts}|${lang}` -> translated text
+export default function Listener({ params }) {
+  const code = params.code;
+  const [myLang, setMyLang] = useState('es'); // default to Spanish as example
+  const [speak, setSpeak]   = useState(true);
+  const [voice, setVoice]   = useState(null);
+  const [voices, setVoices] = useState([]);
+  const [lines, setLines]   = useState([]);
 
-  // poll source lines
-  useEffect(() => {
-    const id = setInterval(async () => {
+  const sseRef = useRef(null);
+  const audioQueueRef = useRef([]); // { blobUrl }
+  const playingRef = useRef(false);
+
+  function pushLine(text) {
+    setLines(prev => [{ ts: Date.now(), text }, ...prev].slice(0,200));
+  }
+
+  useEffect(()=>{
+    fetch('/api/voices').then(r=>r.json()).then(d=>{
+      setVoices(d?.voices || []);
+      if (d?.voices?.length) setVoice(d.voices[0].voice_id);
+    });
+  }, []);
+
+  function speakNext() {
+    if (playingRef.current) return;
+    const item = audioQueueRef.current.shift();
+    if (!item) return;
+    playingRef.current = true;
+    const audio = new Audio(item.blobUrl);
+    audio.onended = () => {
+      playingRef.current = false;
+      URL.revokeObjectURL(item.blobUrl);
+      speakNext();
+    };
+    audio.play().catch(()=> {
+      playingRef.current = false;
+      // user interaction may be required to start audio; ignore
+    });
+  }
+
+  async function handleTranscriptEvent(text) {
+    // Translate for captions
+    const tr = await fetch('/api/translate', {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify({ text, targetLang: myLang })
+    }).then(r=>r.json()).catch(()=> ({}));
+    const translated = tr?.text || text;
+    pushLine(translated);
+
+    if (speak && voice) {
+      // get audio from ElevenLabs
+      const tts = await fetch('/api/tts', {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify({ text: translated, voiceId: voice })
+      });
+      if (tts.ok) {
+        const buf = await tts.arrayBuffer();
+        const blobUrl = URL.createObjectURL(new Blob([buf], { type:'audio/mpeg' }));
+        audioQueueRef.current.push({ blobUrl });
+        speakNext();
+      }
+    }
+  }
+
+  useEffect(()=>{
+    if (sseRef.current) sseRef.current.close();
+    const es = new EventSource(`/api/stream?code=${code}`);
+    sseRef.current = es;
+    es.onmessage = (e) => {
       try {
-        const r = await fetch(`/api/stream?code=${code}&since=${cursorRef.current}`, { cache: 'no-store' });
-        const j = await r.json();
-        if (j?.items?.length) {
-          cursorRef.current = j.next ?? cursorRef.current;
-          setLog(prev => [...prev, ...j.items]);
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'transcript' && msg.text) {
+          handleTranscriptEvent(msg.text);
         }
       } catch {}
-    }, 900);
-    return () => clearInterval(id);
-  }, [code]);
-
-  // translate new lines (or show originals)
-  useEffect(() => {
-    let cancelled = false;
-
-    const run = async () => {
-      if (lang === 'orig') {
-        setView(log);
-        return;
-      }
-      const work = [];
-      const next = [];
-
-      for (const item of log) {
-        const key = `${item.ts}|${lang}`;
-        const fromCache = cache.current.get(key);
-        if (fromCache) {
-          next.push({ ts: item.ts, text: fromCache });
-        } else {
-          work.push(
-            fetch('/api/translate', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ text: item.text, target: lang }),
-            })
-            .then(r => r.json())
-            .then(j => {
-              const out = (j?.text || item.text);
-              cache.current.set(key, out);
-              return { ts: item.ts, text: out };
-            })
-            .catch(() => ({ ts: item.ts, text: item.text }))
-          );
-        }
-      }
-
-      if (work.length) {
-        const fresh = await Promise.all(work);
-        if (!cancelled) {
-          // merge: prefer translated entries where available
-          const map = new Map(next.map(x => [x.ts, x.text]));
-          for (const f of fresh) map.set(f.ts, f.text);
-          const merged = log.map(x => ({ ts: x.ts, text: map.get(x.ts) || x.text }));
-          setView(merged);
-        }
-      } else {
-        setView(next.length ? next : log);
-      }
     };
-
-    run();
-    return () => { cancelled = true; };
-  }, [log, lang]);
+    es.onerror = () => {
+      es.close();
+      setTimeout(()=> {
+        const neo = new EventSource(`/api/stream?code=${code}`);
+        sseRef.current = neo;
+      }, 1000);
+    };
+    return ()=> es.close();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [code, myLang, voice, speak]);
 
   return (
-    <div style={{ maxWidth: 900, margin: '40px auto', padding: 12 }}>
-      <h1>OneVoice — Live Captions</h1>
-
-      <div style={{ display:'flex', gap:10, alignItems:'center', flexWrap:'wrap' }}>
-        <div>Session: <b>{code}</b></div>
+    <div style={{ padding:'24px', maxWidth:1000, margin:'0 auto', fontFamily:'system-ui, sans-serif' }}>
+      <h1 style={{ fontSize:28, marginBottom:12 }}>OneVoice — Live Captions</h1>
+      <div style={{ display:'flex', gap:12, alignItems:'center', flexWrap:'wrap', marginBottom:12 }}>
+        <div><b>Session:</b> {code}</div>
         <div>
-          My language:&nbsp;
-          <select value={lang} onChange={e => setLang(e.target.value)}>
-            {LANGS.map(([label, value]) => <option key={value} value={value}>{label}</option>)}
+          <label>My language:&nbsp;</label>
+          <select value={myLang} onChange={e=>setMyLang(e.target.value)}>
+            {LANGS.map(l => <option key={l.v} value={l.v}>{l.label}</option>)}
+          </select>
+        </div>
+        <div>
+          <label><input type="checkbox" checked={speak} onChange={e=>setSpeak(e.target.checked)} /> Speak</label>
+        </div>
+        <div>
+          <label>Voice:&nbsp;</label>
+          <select value={voice || ''} onChange={e=>setVoice(e.target.value)}>
+            {voices.map(v => <option key={v.voice_id} value={v.voice_id}>{v.name}</option>)}
           </select>
         </div>
       </div>
 
-      <div style={{ background:'#0f172a', color:'#e2e8f0', padding:'14px 16px', borderRadius:10, marginTop:12 }}>
-        {view.length === 0 && <div>Waiting for speech…</div>}
-        {view.map((item, i) => (
-          <div key={i} style={{ padding:'4px 0' }}>
-            <span style={{ opacity:.6, marginRight:8 }}>{new Date(item.ts).toLocaleTimeString()}</span>
-            <span>🌍 {item.text}</span>
+      <div style={{ background:'#0f1820', color:'#dfe7ef', padding:16, borderRadius:8, minHeight:120 }}>
+        {lines.map((r,i)=>(
+          <div key={i} style={{ opacity:i?0.85:1 }}>
+            <small>{new Date(r.ts).toLocaleTimeString()} — </small>{r.text}
           </div>
         ))}
       </div>
