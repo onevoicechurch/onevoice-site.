@@ -1,37 +1,18 @@
-import { kv, ssKey, auKey, evKey } from './kv';
+// app/api/_lib/sessionStore.ts
+import { kvGet, kvSet, kvDel } from "./kv";
 
-function randCode() {
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let s = '';
-  for (let i = 0; i < 4; i++) s += alphabet[Math.floor(Math.random()*alphabet.length)];
-  return s;
-}
+const PREFIX = "onevoice:session:";
 
-export async function createSession(inputLang='AUTO') {
-  let code;
-  for (let tries=0; tries<10; tries++){
-    code = randCode();
-    const exists = await kv.exists(ssKey(code));
-    if (!exists) break;
-  }
-  const now = Date.now();
-  await kv.hset(ssKey(code), { createdAt: String(now), inputLang });
-  await kv.del(auKey(code));
-  await kv.del(evKey(code));
-  return code;
-}
+export type Session = { code: string; createdAt: number };
 
-export async function endSession(code) {
-  await kv.del(auKey(code));
-  await kv.del(evKey(code));
-  await kv.del(ssKey(code));
-}
+export const newCode = () =>
+  Math.random().toString(36).slice(2, 6).toUpperCase(); // e.g. “ABCD”
 
-export async function setInputLang(code, inputLang) {
-  await kv.hset(ssKey(code), { inputLang });
-}
+export const createSession = async (code: string) =>
+  kvSet<Session>(PREFIX + code, { code, createdAt: Date.now() }, 60 * 60 * 6); // 6h TTL
 
-export async function getInputLang(code) {
-  const h = await kv.hgetall(ssKey(code));
-  return h?.inputLang || 'AUTO';
-}
+export const getSession = async (code: string) =>
+  kvGet<Session>(PREFIX + code);
+
+export const endSession = async (code: string) =>
+  kvDel(PREFIX + code);
