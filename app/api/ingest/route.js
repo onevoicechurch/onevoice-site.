@@ -1,19 +1,24 @@
-import { appendLog } from "../_lib/kv";
+import { NextResponse } from 'next/server';
+import { kv, appendLog } from '../_lib/kv';
 
-export const runtime = "nodejs";
+export const runtime = 'nodejs';
 
+// Accept text chunks from the operator console and store to KV
 export async function POST(req) {
   const body = await req.json().catch(() => ({}));
-  const code = (body?.code ? String(body.code) : "").toUpperCase();
-  const text = body?.text ? String(body.text) : "";
+  const code = (body?.code || '').toUpperCase();
+  const text = body?.text || '';
+  const lang = body?.lang || ''; // optional, iso code like 'en', 'es'
 
   if (!code || !text) {
-    return new Response(JSON.stringify({ ok: false, error: "MISSING_FIELDS" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
+    return NextResponse.json({ ok: false, error: 'MISSING_CODE_OR_TEXT' }, { status: 400 });
   }
 
+  // Append to the session log (used by /api/stream to fan out to listeners)
   await appendLog(code, text);
-  return Response.json({ ok: true });
+
+  // Optionally flag “latest line” for quick polling UIs
+  await kv.set(`onevoice:latest:${code}`, { text, lang, t: Date.now() });
+
+  return NextResponse.json({ ok: true });
 }
