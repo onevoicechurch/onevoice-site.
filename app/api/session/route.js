@@ -1,28 +1,33 @@
-import { kv } from "../_lib/kv";
+import { NextResponse } from 'next/server';
+import { kv } from '../_lib/kv';
 
-export const runtime = "nodejs";
+export const runtime = 'nodejs';
 
 function newCode() {
-  // 4-letter/number code, uppercase
-  return Math.random().toString(36).slice(2, 6).toUpperCase();
+  // short random session code
+  return Math.random().toString(36).slice(2, 10).toUpperCase();
 }
 
+// Create a session (returns { ok, code })
 export async function POST(req) {
   const body = await req.json().catch(() => ({}));
-  const provided = body?.code ? String(body.code) : "";
-  const code = (provided || newCode()).toUpperCase().slice(0, 4);
+  const provided = body?.code ? String(body.code) : '';
+  const code = (provided || newCode()).toUpperCase().slice(0, 8);
 
-  // Keep a small session record (4 hours expiry)
-  await kv.set(`onevoice:session:${code}`, { createdAt: Date.now() }, { ex: 60 * 60 * 4 });
+  // initialize an empty log list for this session (optional)
+  await kv.set(`onevoice:session:${code}`, { createdAt: Date.now() });
 
-  return Response.json({ ok: true, code });
+  return NextResponse.json({ ok: true, code });
 }
 
+// Delete a session
 export async function DELETE(req) {
-  const u = new URL(req.url);
-  const code = (u.searchParams.get("code") || "").toUpperCase();
-  if (!code) return new Response("Missing code", { status: 400 });
-
+  const url = new URL(req.url);
+  const code = (url.searchParams.get('code') || '').toUpperCase();
+  if (!code) {
+    return NextResponse.json({ ok: false, error: 'MISSING_CODE' }, { status: 400 });
+  }
   await kv.del(`onevoice:session:${code}`);
-  return Response.json({ ok: true });
+  await kv.del(`onevoice:log:${code}`);
+  return NextResponse.json({ ok: true });
 }
