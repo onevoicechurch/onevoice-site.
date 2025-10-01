@@ -1,40 +1,52 @@
-import { getLinesSince } from '../_lib/sessionStore';
-
 export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
 
-function sseTransform() {
+import { kv, evKey } from '../_lib/kv';
+
+export async function GET(req) {
+  const { searchParams } = new URL(req.url);
+  const code = searchParams.get('code');
+  if (!code) return new Response('Missing code', { status:400 });
+
   const encoder = new TextEncoder();
-  return new TransformStream({
-    transform(chunk, controller) {
-      controller.enqueue(encoder.encode(chunk));
+  const stream = new ReadableStream({
+    async start(controller) {
+      let cursor = 0;
+      const key = evKey(code);
+      const write = (obj) => {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+      };
+
+      // Immediately send a 'ready' event so the UI knows SSE is alive
+      write({ type:'ready', ts:Date.now() });
+
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < 55000) { // ~55s, client will auto-reconnect
+        try {
+          const items = await kv.lrange(key, cursor, -1);
+          if (items && items.length) {
+            for (const s of items) {
+              try {
+                const ev = JSON.parse(s);
+                write({ type:'transcript', ...ev });
+              } catch {
+                // ignore malformed
+              }
+            }
+            cursor += items.length;
+          }
+        } catch {}
+        await new Promise(r => setTimeout(r, 600));
+      }
+      // graceful end; client will reconnect
+      controller.close();
+    }
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive'
     }
   });
 }
-
-export async function GET(req) {
-  const u = new URL(req.url);
-  const code = (u.searchParams.get('code') || '').toUpperCase();
-  const since = Number(u.searchParams.get('since') || 0);
-
-  if (!code) {
-    return new Response('missing code', { status: 400 });
-  }
-
-  const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
-  const send = async (obj) => writer.write(`data: ${JSON.stringify(obj)}\n\n`);
-
-  // Kick initial batch
-  let lastId = Number.isNaN(since) ? 0 : since;
-  const initial = await getLinesSince(code, lastId, 100);
-  if (initial.length) {
-    lastId = initial[initial.length - 1].id;
-    await send({ type: 'batch', lines: initial });
-  } else {
-    await send({ type: 'noop' });
-  }
-
-  // Poll loop (lightweight) for up to 60s; client will reconnect
-  let alive = true;
-  req.signal.addEventListener('abort', () =>
