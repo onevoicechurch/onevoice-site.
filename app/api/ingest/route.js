@@ -4,96 +4,76 @@ import { kv, appendLog } from '../_lib/kv';
 
 export const runtime = 'nodejs';
 
-// --- helper: call Deepgram on a single audio chunk --------------------------
-async function deepgramTranscribe(blob, lang) {
-  const apiKey = process.env.DEEPGRAM_API_KEY;
-  if (!apiKey) throw new Error('Missing DEEPGRAM_API_KEY');
+const DG_URL_BASE = 'https://api.deepgram.com/v1/listen';
 
-  // Pick model + language
-  // If you want auto-language, use language=multilingual
-  const language = lang && lang !== 'AUTO' ? lang : 'multilingual';
-  const model = 'nova-2-general'; // solid, low latency
-
-  const res = await fetch(
-    `https://api.deepgram.com/v1/listen?model=${encodeURIComponent(model)}&language=${encodeURIComponent(language)}`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Token ${apiKey}`,
-        // We recorded with MediaRecorder -> webm/opus
-        'Content-Type': 'audio/webm',
-        Accept: 'application/json'
-      },
-      body: blob
-    }
-  );
-
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    throw new Error(`Deepgram error ${res.status}: ${txt}`);
-  }
-
-  const json = await res.json();
-  // Defensive pulls across versions
-  const alt =
-    json?.results?.channels?.[0]?.alternatives?.[0] ??
-    json?.channel?.alternatives?.[0];
-
-  const transcript = alt?.transcript?.trim() || '';
-  return transcript;
+// Map incoming UI values to Deepgram language param
+function mapLang(v) {
+  if (!v) return 'multi';
+  const s = String(v).trim().toLowerCase();
+  if (s === 'auto' || s === 'auto-detect' || s === 'detect') return 'multi';
+  return s; // e.g., 'en', 'es', 'pt', 'fr', 'de', ...
 }
 
-// --- main handler -----------------------------------------------------------
-// Accepts EITHER:
-// 1) multipart/form-data with fields: audio (Blob), code (string), lang (string?)
-// 2) application/json with { code } -> a "flush ping" (no audio)
 export async function POST(req) {
   try {
-    const ctype = req.headers.get('content-type') || '';
+    const { searchParams } = new URL(req.url);
+    const code = (searchParams.get('code') || '').toUpperCase();
+    const langParam = mapLang(searchParams.get('lang'));
 
-    // --- JSON "flush" ping (no audio) --------------------------------------
-    if (ctype.includes('application/json')) {
-      const body = await req.json().catch(() => ({}));
-      const code = (body?.code || '').toUpperCase();
-      if (!code) {
-        return NextResponse.json({ ok: false, error: 'MISSING_CODE' }, { status: 400 });
-      }
-
-      // For polling UIs, keep "latest"
-      await kv.set(`onevoice:latest:${code}`, { text: '', lang: '', t: Date.now() });
-      return NextResponse.json({ ok: true });
+    if (!code) {
+      return NextResponse.json({ ok: false, error: 'MISSING_CODE' }, { status: 400 });
     }
 
-    // --- Multipart with audio chunk ----------------------------------------
-    if (ctype.includes('multipart/form-data')) {
-      const form = await req.formData();
-      const code = String(form.get('code') || '').toUpperCase();
-      const lang = String(form.get('lang') || '');
-      const audio = form.get('audio'); // this is a Blob
-
-      if (!code || !audio) {
-        return NextResponse.json({ ok: false, error: 'MISSING_CODE_OR_AUDIO' }, { status: 400 });
-      }
-
-      // Transcribe with Deepgram
-      const text = await deepgramTranscribe(audio, lang);
-
-      // If we got real text, fan it out
-      if (text) {
-        await appendLog(code, text);
-        await kv.set(`onevoice:latest:${code}`, { text, lang, t: Date.now() });
-      }
-
-      return NextResponse.json({ ok: true, text });
+    // grab raw audio bytes from MediaRecorder (webm/opus)
+    const audio = await req.arrayBuffer();
+    if (!audio || audio.byteLength === 0) {
+      return NextResponse.json({ ok: false, error: 'EMPTY_AUDIO' }, { status: 400 });
     }
 
-    // --- Unknown body type --------------------------------------------------
-    return NextResponse.json({ ok: false, error: 'UNSUPPORTED_CONTENT_TYPE' }, { status: 415 });
+    // Build Deepgram request: nova-2 + language=multi|en|es...
+    const dgUrl = `${DG_URL_BASE}?model=nova-2&smart_format=true&language=${encodeURIComponent(langParam)}`;
+
+    const dgRes = await fetch(dgUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
+        'Content-Type': 'audio/webm;codecs=opus'
+      },
+      body: audio
+    });
+
+    if (!dgRes.ok) {
+      const text = await dgRes.text().catch(() => '');
+      return NextResponse.json(
+        { ok: false, error: `Deepgram error ${dgRes.status}: ${text}` },
+        { status: 400 }
+      );
+    }
+
+    const dg = await dgRes.json().catch(() => ({}));
+
+    // Pull a best-effort transcript string
+    let text = '';
+    try {
+      // JSON shape varies slightly by endpoint; these two cover current nova-2 responses
+      text =
+        dg?.results?.channels?.[0]?.alternatives?.[0]?.transcript ||
+        dg?.channel?.alternatives?.[0]?.transcript ||
+        '';
+    } catch {}
+    text = (text || '').trim();
+
+    if (!text) {
+      return NextResponse.json({ ok: true, text: '' }); // nothing spoken in this chunk
+    }
+
+    // Store and fan out
+    await appendLog(code, text);
+    await kv.set(`onevoice:latest:${code}`, { text, lang: langParam, t: Date.now() });
+
+    return NextResponse.json({ ok: true, text });
   } catch (err) {
-    // Make the failure visible in the Network "Response" pane
-    return NextResponse.json(
-      { ok: false, error: String(err?.message || err) },
-      { status: 502 }
-    );
+    console.error('INGEST_CRASH', err);
+    return NextResponse.json({ ok: false, error: 'INGEST_CRASH' }, { status: 500 });
   }
 }
