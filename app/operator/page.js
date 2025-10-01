@@ -1,157 +1,206 @@
 'use client';
+
 import { useEffect, useRef, useState } from 'react';
 
-const SEG_MS = 3000; // short segments so it feels continuous
+const LANGS = [
+  { v:'AUTO', label:'Auto-detect' },
+  { v:'en', label:'English (United States)' },
+  { v:'es', label:'Spanish' },
+  { v:'pt', label:'Portuguese' },
+  { v:'fr', label:'French' },
+  { v:'de', label:'German' }
+];
 
-export default function OperatorPage() {
-  const [code, setCode] = useState(() => Math.random().toString(36).slice(2, 6).toUpperCase());
+export default function Operator() {
+  const [code, setCode] = useState(null);
+  const [inputLang, setInputLang] = useState('AUTO');
   const [running, setRunning] = useState(false);
-  const [status, setStatus] = useState('Idle');
-  const [inputLang, setInputLang] = useState('AUTO'); // 'AUTO' or BCP-47
+  const [status, setStatus] = useState('—');
   const [log, setLog] = useState([]);
-  const cursorRef = useRef(0);
 
   const mediaRef = useRef(null);
-  const recRef = useRef(null);
-  const segTimerRef = useRef(null);
+  const recRef   = useRef(null);
+  const analyserRef = useRef(null);
+  const silenceMsRef = useRef(0);
+  const lastChunkAtRef = useRef(0);
+  const sseRef = useRef(null);
 
-  // create session on mount or code change
-  useEffect(() => {
-    setLog([]);
-    cursorRef.current = 0;
-    fetch('/api/session', { method: 'POST', body: JSON.stringify({ code }), headers: { 'Content-Type': 'application/json' } })
-      .then(() => setStatus(`Session ${code} ready`))
-      .catch(() => setStatus('Session error'));
-    return () => { fetch(`/api/session?code=${code}`, { method: 'DELETE' }).catch(()=>{}); };
-  }, [code]);
-
-  // poll for new lines
-  useEffect(() => {
-    const id = setInterval(async () => {
-      try {
-        const r = await fetch(`/api/stream?code=${code}&since=${cursorRef.current}`, { cache: 'no-store' });
-        const j = await r.json();
-        if (j?.items?.length) {
-          setLog(prev => [...prev, ...j.items]);
-          cursorRef.current = j.next ?? cursorRef.current;
-        }
-      } catch {}
-    }, 800);
-    return () => clearInterval(id);
-  }, [code]);
-
-  function pickMime() {
-    if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) return 'audio/webm;codecs=opus';
-    if (MediaRecorder.isTypeSupported('audio/webm')) return 'audio/webm';
-    if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) return 'audio/ogg;codecs=opus';
-    return '';
+  function pushLog(line) {
+    setLog(prev => [{ ts: Date.now(), line }, ...prev].slice(0,200));
   }
 
-  const startMic = async () => {
-    if (running) return;
+  async function newSession() {
+    const r = await fetch('/api/session', {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify({ inputLang })
+    }).then(r=>r.json());
+    if (!r.ok) { alert('Failed to create session'); return; }
+    setCode(r.code);
+    pushLog(`Session ${r.code} ready`);
+    setStatus('Session ready');
+    startSSE(r.code);
+  }
+
+  function startSSE(c) {
+    if (sseRef.current) sseRef.current.close();
+    const es = new EventSource(`/api/stream?code=${c}`);
+    sseRef.current = es;
+    es.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'transcript' && msg.text) {
+          pushLog(msg.text);
+        }
+      } catch {}
+    };
+    es.onerror = () => {
+      es.close();
+      // auto-reconnect
+      setTimeout(()=> startSSE(c), 1000);
+    };
+  }
+
+  async function toggleMic() {
+    if (running) {
+      await stopMic(true);
+    } else {
+      await startMic();
+    }
+  }
+
+  async function startMic() {
+    if (!code) await newSession();
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        video: false,
-      });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio:true });
       mediaRef.current = stream;
+
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      src.connect(analyser);
+      analyserRef.current = analyser;
+
+      // Mic state
       setRunning(true);
+      setStatus('Mic ON');
 
-      const mime = pickMime();
-      const makeRecorder = () => {
-        const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      // Silence detector
+      silenceMsRef.current = 0;
+      lastChunkAtRef.current = Date.now();
+      const vadTimer = setInterval(async ()=>{
+        // Measure amplitude
+        const buf = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteTimeDomainData(buf);
+        let mean = 0;
+        for (let i=0;i<buf.length;i++){
+          const v = (buf[i] - 128)/128;
+          mean += v*v;
+        }
+        mean = Math.sqrt(mean/buf.length); // RMS ~ 0..1
+        const silent = mean < 0.015; // tune as needed
 
-        rec.ondataavailable = async (e) => {
-          // will fire with a finalized blob ONLY after stop()
-          if (!e.data || e.data.size < 4000) return; // tiny chunks are usually header-only
-          try {
-            setStatus('Uploading…');
-            const qs = new URLSearchParams({
-              code,
-              inputLang: inputLang === 'AUTO' ? '' : inputLang,
-            });
-            const ab = await e.data.arrayBuffer();
-            await fetch('/api/ingest?' + qs.toString(), {
-              method: 'POST',
-              headers: { 'Content-Type': e.data.type || 'application/octet-stream' },
-              body: ab,
-            });
-            setStatus('Chunk processed');
-          } catch (err) {
-            console.error('ingest send error', err);
-            setStatus('Upload error');
-          }
-        };
+        if (silent) {
+          silenceMsRef.current += 200;
+        } else {
+          silenceMsRef.current = 0;
+        }
 
-        rec.onstart = () => {
-          segTimerRef.current = window.setTimeout(() => {
-            try { rec.state !== 'inactive' && rec.stop(); } catch {}
-          }, SEG_MS);
-        };
+        // If we have at least ~2.5s of speech since last flush AND ~600ms silence → flush
+        const since = Date.now() - lastChunkAtRef.current;
+        if (since > 2500 && silenceMsRef.current > 600) {
+          await fetch(`/api/ingest?code=${code}&flush=1`, { method:'POST' }).catch(()=>{});
+          lastChunkAtRef.current = Date.now();
+        }
+      }, 200);
 
-        rec.onstop = () => {
-          window.clearTimeout(segTimerRef.current);
-          if (running && mediaRef.current) {
-            // immediately start next segment while mic stays open
-            makeRecorder();
-          }
-        };
+      // MediaRecorder (1s chunks)
+      const mr = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      recRef.current = { mr, vadTimer, ctx };
 
-        rec.start(); // no timeslice — we manually stop to finalize the container
-        recRef.current = rec;
+      mr.ondataavailable = async (ev) => {
+        if (ev.data && ev.data.size > 0) {
+          const buf = await ev.data.arrayBuffer();
+          lastChunkAtRef.current = Date.now();
+          await fetch(`/api/ingest?code=${code}`, {
+            method:'POST',
+            body: buf
+          }).catch(()=>{});
+        }
       };
-
-      makeRecorder();
+      mr.start(1000);
     } catch (e) {
-      console.error('getUserMedia failed', e);
-      setStatus('Mic permission/selection error');
+      console.error(e);
+      alert('Microphone not available');
     }
-  };
+  }
 
-  const stopMic = () => {
+  async function stopMic(finalFlush=false) {
     setRunning(false);
-    try { recRef.current && recRef.current.state !== 'inactive' && recRef.current.stop(); } catch {}
-    if (mediaRef.current) {
-      mediaRef.current.getTracks().forEach(t => t.stop());
-      mediaRef.current = null;
+    setStatus('Mic OFF');
+
+    try {
+      recRef.current?.mr?.stop();
+    } catch {}
+    try { mediaRef.current?.getTracks?.().forEach(t=>t.stop()); } catch {}
+    try { clearInterval(recRef.current?.vadTimer); } catch {}
+    try { recRef.current?.ctx?.close(); } catch {}
+
+    if (finalFlush) {
+      await fetch(`/api/ingest?code=${code}&final=1`, { method:'POST' }).catch(()=>{});
     }
-  };
+  }
+
+  useEffect(()=>{
+    // create a session automatically on first load
+    newSession();
+    return ()=> {
+      try { sseRef.current?.close(); } catch {}
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function updateLang(v) {
+    setInputLang(v);
+    if (code) {
+      await fetch('/api/session', {
+        method:'PATCH',
+        headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify({ code, inputLang: v })
+      });
+    }
+  }
+
+  const micLabel = running ? 'Mic ON' : 'Mic OFF';
 
   return (
-    <div style={{ maxWidth: 980, margin: '40px auto', padding: 12 }}>
-      <h1>🖥️ Operator Console (Whisper)</h1>
+    <div style={{ padding:'24px', maxWidth:1000, margin:'0 auto', fontFamily:'system-ui, sans-serif' }}>
+      <h1 style={{ fontSize:28, marginBottom:12 }}>🖥️ Operator Console (Whisper)</h1>
 
-      <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-        <div>Access Code: <b>{code}</b></div>
-        <button onClick={() => setCode(Math.random().toString(36).slice(2, 6).toUpperCase())}>New Session</button>
-        <a href={`/s/${code}`} target="_blank" rel="noreferrer">Open Listener</a>
+      <div style={{ display:'flex', gap:12, alignItems:'center', flexWrap:'wrap' }}>
+        <div><b>Access Code:</b> {code || '----'}</div>
+        <button onClick={newSession}>New Session</button>
+        <a href={code ? `/s/${code}` : '#'} target="_blank" rel="noreferrer">Open Listener</a>
         <div>
-          Input language:&nbsp;
-          <select value={inputLang} onChange={e => setInputLang(e.target.value)}>
-            <option value="AUTO">Auto-detect</option>
-            <option value="en">English (United States)</option>
-            <option value="es">Spanish</option>
-            <option value="vi">Vietnamese</option>
-            <option value="zh">Chinese</option>
-            {/* add more as needed */}
+          <label>Input language:&nbsp;</label>
+          <select value={inputLang} onChange={e=>updateLang(e.target.value)}>
+            {LANGS.map(l => <option key={l.v} value={l.v}>{l.label}</option>)}
           </select>
         </div>
-        {!running
-          ? <button style={{ background:'#16a34a', color:'#fff' }} onClick={startMic}>Mic ON</button>
-          : <button style={{ background:'#ef4444', color:'#fff' }} onClick={stopMic}>Mic OFF</button>}
-        <button onClick={() => { stopMic(); fetch(`/api/session?code=${code}`, { method:'DELETE' }); }}>End Session</button>
-        <div>Status: {status}</div>
+        <button
+          onClick={toggleMic}
+          style={{ background: running ? '#16a34a' : '#ef4444', color:'#fff', padding:'6px 12px', borderRadius:6 }}
+        >{micLabel}</button>
+        <button onClick={()=>stopMic(true)}>End Session</button>
+        <div> Status: {status}</div>
       </div>
 
-      <h3>Live Preview (spoken text)</h3>
-      <div style={{ background:'#0f172a', color:'#e2e8f0', padding:'14px 16px', borderRadius:10, marginTop:8 }}>
-        {log.length === 0 && <div>🕑 — No lines yet…</div>}
-        {log.map((item, i) => (
-          <div key={i} style={{ padding:'4px 0' }}>
-            <span style={{ opacity: .6, marginRight: 8 }}>
-              {new Date(item.ts).toLocaleTimeString()}
-            </span>
-            <span>🗣️ {item.text}</span>
+      <h3 style={{ marginTop:24 }}>Live Preview (spoken text)</h3>
+      <div style={{ background:'#0f1820', color:'#dfe7ef', padding:16, borderRadius:8, minHeight:160 }}>
+        {log.map((r,i)=>(
+          <div key={i} style={{ opacity: i?0.8:1 }}>
+            <small>{new Date(r.ts).toLocaleTimeString()} — </small> {r.line}
           </div>
         ))}
       </div>
