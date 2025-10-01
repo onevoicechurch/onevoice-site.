@@ -1,55 +1,72 @@
-import { kv } from "../_lib/kv";
+import { kv } from '../_lib/kv';
 
-export const runtime = "nodejs";
+export const runtime = 'nodejs';
 
 const enc = new TextEncoder();
 
 function sseHeaders() {
-  return {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no", // try to avoid buffering on some proxies
-  };
+  return new Headers({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no' // helps prevent proxy buffering
+  });
 }
 
-function write(controller, payload) {
+function writeEvent(writer, payload) {
   const line = `data: ${JSON.stringify(payload)}\n\n`;
-  controller.enqueue(enc.encode(line));
+  return writer.write(enc.encode(line));
 }
 
+// Server-Sent Events stream: clients receive appended log lines
 export async function GET(req) {
-  const u = new URL(req.url);
-  const code = (u.searchParams.get("code") || "").toUpperCase();
-  if (!code) return new Response("Missing code", { status: 400 });
+  const url = new URL(req.url);
+  const code = (url.searchParams.get('code') || '').toUpperCase();
+  if (!code) {
+    return new Response(JSON.stringify({ ok: false, error: 'MISSING_CODE' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
 
-  const key = `onevoice:log:${code}`;
-
-  let timer;
+  const logKey = `onevoice:log:${code}`;
+  let cursor = 0; // how many entries we’ve sent
 
   const stream = new ReadableStream({
     async start(controller) {
-      // initial event so the client knows we’re live
-      write(controller, { ok: true, ready: true });
+      const writer = controller;
 
-      timer = setInterval(async () => {
+      // Initial replay (send anything already in the list)
+      const existing = await kv.lrange(logKey, 0, -1);
+      for (const item of existing) {
+        await writeEvent(writer, { type: 'line', ...item });
+      }
+      cursor = existing.length;
+
+      // Poll for new entries every 300ms
+      const timer = setInterval(async () => {
         try {
-          const len = await kv.llen(key);
-          if (len > 0) {
-            const items = await kv.lrange(key, 0, -1); // read all
-            for (const item of items) write(controller, item);
-            await kv.del(key); // clear after flushing
+          const total = await kv.llen(logKey);
+          if (total > cursor) {
+            const fresh = await kv.lrange(logKey, cursor, total - 1);
+            for (const item of fresh) {
+              await writeEvent(writer, { type: 'line', ...item });
+            }
+            cursor = total;
           }
+          // keep-alive ping
+          await writeEvent(writer, { type: 'ping', t: Date.now() });
         } catch (e) {
-          write(controller, { ok: false, error: "kv_error", message: String(e) });
-          clearInterval(timer);
-          controller.close();
+          await writeEvent(writer, { type: 'error', message: String(e) });
         }
-      }, 800); // ~1s polling
+      }, 300);
+
+      // Cleanup
+      stream.cancel = () => clearInterval(timer);
     },
     cancel() {
-      if (timer) clearInterval(timer);
-    },
+      // handled above
+    }
   });
 
   return new Response(stream, { headers: sseHeaders() });
