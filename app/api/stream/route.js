@@ -1,86 +1,52 @@
-// app/api/stream/route.ts
-import { kv } from "../_lib/kv";
+export const runtime = 'nodejs';
 
-export const runtime = "nodejs";
+import { kv } from '../_lib/kv.js';
 
-const listKey = (code: string) => `onevoice:log:${code}`;
 const enc = new TextEncoder();
+const listKey = (code) => `onevoice:log:${code}`;
 
-function sseInit(): Headers {
-  const h = new Headers();
-  h.set("Content-Type", "text/event-stream; charset=utf-8");
-  h.set("Cache-Control", "no-cache, no-transform");
-  h.set("Connection", "keep-alive");
-  h.set("X-Accel-Buffering", "no"); // avoid buffering on some proxies
-  return h;
+function sseHeaders() {
+  return {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+  };
 }
 
-// Utility to write one SSE event
-async function writeEvent(writer: WritableStreamDefaultWriter<Uint8Array>, payload: unknown) {
-  const line = `data: ${JSON.stringify(payload)}\n\n`;
-  await writer.write(enc.encode(line));
-}
-
-export async function GET(req: Request) {
+export async function GET(req) {
   const { searchParams } = new URL(req.url);
-  const code = (searchParams.get("code") || "").toUpperCase();
-  if (!code) {
-    return new Response(JSON.stringify({ ok: false, error: "MISSING_CODE" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
+  const code = (searchParams.get('code') || '').toUpperCase();
+  if (!code) return new Response('Missing code', { status: 400 });
 
-  const headers = sseInit();
-
-  // Stream response body
-  const stream = new ReadableStream<Uint8Array>({
+  const stream = new ReadableStream({
     async start(controller) {
-      const writer = controller.writable?.getWriter?.() ?? (controller as any).getWriter?.() ?? (controller as any);
-      const w = (writer as WritableStreamDefaultWriter<Uint8Array>) || {
-        write: (chunk: Uint8Array) => controller.enqueue(chunk),
-      };
+      let idx = 0;
+      controller.enqueue(enc.encode(`event: ready\ndata: "${code}"\n\n`));
 
-      // Initial hello
-      await writeEvent(w, { ok: true, ready: true, code });
-
-      let cursor = 0;
-      const key = listKey(code);
-      const abort = (req as any).signal as AbortSignal | undefined;
-
-      // Poll loop — lightweight, stateless, Vercel-friendly
-      try {
-        while (!abort?.aborted) {
-          // How many items currently in the list?
-          const len = (await kv.llen(key)) ?? 0;
-
-          if (len > cursor) {
-            // Fetch only the new slice [cursor .. end]
-            const items = (await kv.lrange<string>(key, cursor, -1)) || [];
-            for (const raw of items) {
-              try {
-                const parsed = JSON.parse(raw);
-                await writeEvent(w, parsed);
-              } catch {
-                // If a malformed entry appears, still forward raw text
-                await writeEvent(w, { text: raw });
-              }
+      async function tick() {
+        try {
+          const len = await kv.llen(listKey(code));
+          if (len > idx) {
+            const items = await kv.lrange(listKey(code), idx, len - 1);
+            idx = len;
+            for (const item of items) {
+              controller.enqueue(enc.encode(`data: ${JSON.stringify(item)}\n\n`));
             }
-            cursor = len;
           }
-
-          // Idle wait
-          await new Promise((r) => setTimeout(r, 800));
+          controller.enqueue(enc.encode(`event: ping\ndata: "${Date.now()}"\n\n`));
+        } catch (e) {
+          controller.enqueue(enc.encode(`event: error\ndata: ${JSON.stringify(String(e))}\n\n`));
         }
-      } catch (e) {
-        // If something unexpected happens, try to tell the client
-        try { await writeEvent(w, { ok: false, error: "STREAM_ERROR" }); } catch {}
-      } finally {
-        try { await writeEvent(w, { ok: false, end: true }); } catch {}
-        controller.close();
       }
+
+      const interval = setInterval(tick, 1000);
+      tick();
+      this._close = () => clearInterval(interval);
     },
+    cancel() {
+      if (this._close) this._close();
+    }
   });
 
-  return new Response(stream, { headers });
+  return new Response(stream, { headers: sseHeaders() });
 }
