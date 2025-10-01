@@ -1,16 +1,22 @@
 {
   "name": "onevoice-site",
   "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18.17.0"
+  },
   "scripts": {
     "dev": "next dev -p 3000",
     "build": "next build",
     "start": "next start -p 3000"
   },
   "dependencies": {
+    "@deepgram/sdk": "^3.9.0",
+    "@upstash/redis": "^1.28.4",
+    "elevenlabs": "^1.49.0",
     "next": "14.2.5",
+    "openai": "^4.56.0",
     "react": "18.3.1",
-    "react-dom": "18.3.1",
-    "openai": "4.56.0",
-    "@upstash/redis": "^1.28.4"
+    "react-dom": "18.3.1"
   }
 }
