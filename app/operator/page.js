@@ -1,26 +1,252 @@
-// ...inside startMic()
+'use client';
 
-// choose a Deepgram-friendly codec order (ogg/opus tends to be very solid)
-let mime = "audio/ogg;codecs=opus";
-if (!MediaRecorder.isTypeSupported(mime)) mime = "audio/webm;codecs=opus";
-if (!MediaRecorder.isTypeSupported(mime)) mime = "audio/webm";
-if (!MediaRecorder.isTypeSupported(mime)) mime = "audio/mpeg"; // last resort
+import { useEffect, useRef, useState } from 'react';
 
-const mr = new MediaRecorder(stream, { mimeType: mime });
-recRef.current = { mr, ctx };
+const LANGS = [
+  { v: 'AUTO', label: 'Auto-detect' },
+  { v: 'en', label: 'English (United States)' },
+  { v: 'es', label: 'Spanish' },
+  { v: 'pt', label: 'Portuguese' },
+  { v: 'fr', label: 'French' },
+  { v: 'de', label: 'German' },
+];
 
-mr.ondataavailable = async (ev) => {
-  if (!ev.data || ev.data.size === 0) return;
-  lastChunkAtRef.current = Date.now();
+export default function Operator() {
+  const [code, setCode] = useState(null);
+  const [inputLang, setInputLang] = useState('AUTO');
+  const [running, setRunning] = useState(false);
+  const [status, setStatus] = useState('Mic OFF');
+  const [log, setLog] = useState([]);
+  const [error, setError] = useState('');
 
-  const form = new FormData();
-  form.append("audio", ev.data, ev.data.type.includes("ogg") ? "chunk.ogg" :
-                               ev.data.type.includes("mp3") ? "chunk.mp3" : "chunk.webm");
-  form.append("code", current);
-  form.append("lang", inputLang === "AUTO" ? "" : inputLang);
-  form.append("mime", ev.data.type || mime); // <— tell server what we actually recorded
+  const mediaRef = useRef(null);
+  const recRef = useRef(null);
+  const analyserRef = useRef(null);
+  const vadTimerRef = useRef(null);
+  const lastChunkAtRef = useRef(0);
+  const sseRef = useRef(null);
 
-  await fetch("/api/ingest", { method: "POST", body: form }).catch(() => {});
-};
+  function pushLog(line) {
+    setLog(prev => [{ ts: Date.now(), line }, ...prev].slice(0, 200));
+  }
 
-mr.start(1000); // ~1s chunks
+  async function createSession(lang = inputLang) {
+    const r = await fetch('/api/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inputLang: lang }),
+    }).then(r => r.json()).catch(() => ({ ok: false }));
+
+    if (!r?.ok || !r?.code) {
+      setError('Failed to create session');
+      return null;
+    }
+    setCode(r.code);
+    setError('');
+    pushLog(`Session ${r.code} ready`);
+    startSSE(r.code);
+    return r.code;
+  }
+
+  function startSSE(c) {
+    try { sseRef.current?.close?.(); } catch {}
+    const es = new EventSource(`/api/stream?code=${encodeURIComponent(c)}`);
+    sseRef.current = es;
+
+    es.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg?.type === 'transcript' && msg?.text) {
+          pushLog(msg.text);
+        }
+      } catch {}
+    };
+    es.onerror = () => {
+      try { es.close(); } catch {}
+      setTimeout(() => startSSE(c), 1000);
+    };
+  }
+
+  useEffect(() => {
+    createSession();
+    return () => { try { sseRef.current?.close(); } catch {} };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function onChangeLang(v) {
+    setInputLang(v);
+    if (!code) return;
+    await fetch('/api/session', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code, inputLang: v }),
+    }).catch(() => {});
+  }
+
+  async function toggleMic() {
+    if (running) {
+      await stopMic(true);
+    } else {
+      await startMic();
+    }
+  }
+
+  async function startMic() {
+    const current = code || await createSession(inputLang);
+    if (!current) return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRef.current = stream;
+
+      // Analyser for tiny VAD
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AudioCtx();
+      const src = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      src.connect(analyser);
+      analyserRef.current = analyser;
+
+      // Choose a Deepgram-friendly MIME and remember it
+      let forceMime = 'audio/webm;codecs=opus';
+      if (!MediaRecorder.isTypeSupported(forceMime)) {
+        forceMime = 'audio/ogg;codecs=opus';
+      }
+      if (!MediaRecorder.isTypeSupported(forceMime)) {
+        forceMime = 'audio/webm';
+      }
+      if (!MediaRecorder.isTypeSupported(forceMime)) {
+        forceMime = 'audio/mpeg';
+      }
+
+      const mr = new MediaRecorder(stream, { mimeType: forceMime });
+      recRef.current = { mr, ctx };
+
+      mr.ondataavailable = async (ev) => {
+        if (!ev.data || ev.data.size === 0) return;
+        lastChunkAtRef.current = Date.now();
+
+        const chosenMime = forceMime; // carry exact MIME to server
+        const name =
+          chosenMime.includes('ogg')  ? 'chunk.ogg'  :
+          chosenMime.includes('mpeg') ? 'chunk.mp3'  :
+                                        'chunk.webm';
+
+        const form = new FormData();
+        form.append('audio', ev.data, name);
+        form.append('code', current);
+        form.append('lang', inputLang === 'AUTO' ? '' : inputLang);
+        form.append('mime', chosenMime);
+
+        const r = await fetch('/api/ingest', { method: 'POST', body: form });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          setError(j?.error || `Ingest failed (${r.status})`);
+        } else {
+          setError('');
+        }
+      };
+
+      mr.start(1000); // ~1s chunks
+
+      // Tiny VAD to poke server after silence
+      const VAD_INTERVAL_MS = 200;
+      const SILENCE_THRESHOLD = 0.015;
+      const MIN_SPEECH_MS = 2500;
+      let silenceFor = 0;
+
+      vadTimerRef.current = setInterval(async () => {
+        const buf = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteTimeDomainData(buf);
+
+        let mean = 0;
+        for (let i = 0; i < buf.length; i++) {
+          const v = (buf[i] - 128) / 128;
+          mean += v * v;
+        }
+        mean = Math.sqrt(mean / buf.length);
+        const silent = mean < SILENCE_THRESHOLD;
+        silenceFor = silent ? silenceFor + VAD_INTERVAL_MS : 0;
+
+        const since = Date.now() - lastChunkAtRef.current;
+        if (since > MIN_SPEECH_MS && silenceFor > 600) {
+          await fetch('/api/ingest', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code: current }),
+          }).catch(() => {});
+          lastChunkAtRef.current = Date.now();
+        }
+      }, VAD_INTERVAL_MS);
+
+      setRunning(true);
+      setStatus('Mic ON');
+    } catch (err) {
+      console.error(err);
+      setError('Microphone not available or permission denied.');
+    }
+  }
+
+  async function stopMic(finalFlush = false) {
+    setRunning(false);
+    setStatus('Mic OFF');
+
+    try { recRef.current?.mr?.stop(); } catch {}
+    try { mediaRef.current?.getTracks?.().forEach(t => t.stop()); } catch {}
+    try { clearInterval(vadTimerRef.current); } catch {}
+    try { recRef.current?.ctx?.close(); } catch {}
+
+    if (finalFlush && code) {
+      await fetch('/api/ingest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code }),
+      }).catch(() => {});
+    }
+  }
+
+  return (
+    <div style={{ padding: 24, maxWidth: 1000, margin: '0 auto', fontFamily: 'system-ui, sans-serif' }}>
+      <h1 style={{ fontSize: 28, marginBottom: 12 }}>🖥️ Operator Console (Whisper)</h1>
+
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+        <div><b>Access Code:</b> {code || '----'}</div>
+        <button onClick={() => createSession()}>New Session</button>
+        <a href={code ? `/s/${code}` : '#'} target="_blank" rel="noreferrer">Open Listener</a>
+
+        <div>
+          <label>Input language:&nbsp;</label>
+          <select value={inputLang} onChange={(e) => onChangeLang(e.target.value)}>
+            {LANGS.map(l => <option key={l.v} value={l.v}>{l.label}</option>)}
+          </select>
+        </div>
+
+        <button
+          onClick={toggleMic}
+          style={{ background: running ? '#16a34a' : '#ef4444', color: '#fff', padding: '6px 12px', borderRadius: 6 }}
+        >
+          {running ? 'Mic ON' : 'Mic OFF'}
+        </button>
+
+        <button onClick={() => stopMic(true)}>End Session</button>
+        <div> Status: {status}</div>
+      </div>
+
+      {error && (
+        <div style={{ background:'#ffe2e2', color:'#7a1d1d', padding:12, borderRadius:6, marginTop:12, whiteSpace:'pre-wrap' }}>
+          {error}
+        </div>
+      )}
+
+      <h3 style={{ marginTop: 24 }}>Live Preview (spoken text)</h3>
+      <div style={{ background:'#0f1820', color:'#dfe7ef', padding:16, borderRadius:8, minHeight:160 }}>
+        {log.map((r,i)=>(
+          <div key={i} style={{ opacity: i?0.8:1 }}>
+            <small>{new Date(r.ts).toLocaleTimeString()} — </small> {r.line}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
