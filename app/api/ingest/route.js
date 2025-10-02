@@ -1,88 +1,71 @@
 // app/api/ingest/route.js
 import { NextResponse } from 'next/server';
-import { kv, appendLog } from '../_lib/kv';
+import { kv, appendLog } from '../_lib/kv';  // adjust path if yours differs
 
-export const runtime = 'nodejs'; // we need Node for Buffer
-
-// Adjust these as you like
-const DG_MODEL = 'nova-2';
-const DG_BASE = 'https://api.deepgram.com/v1/listen';
-
-function langQuery(inputLang) {
-  // Deepgram: omit language to auto-detect; otherwise send ISO code like 'en', 'es'
-  if (!inputLang) return '';
-  return `&language=${encodeURIComponent(inputLang)}`;
-}
+export const runtime = 'nodejs';
 
 export async function POST(req) {
   try {
-    // Two modes:
-    // 1) multipart/form-data with 'audio' (preferred)
-    // 2) JSON ping (flush/keepalive)
-    const ctype = req.headers.get('content-type') || '';
+    const { searchParams } = new URL(req.url);
+    const code = (searchParams.get('code') || '').toUpperCase();
+    const lang = (searchParams.get('lang') || 'auto').trim(); // 'auto' or 'en', 'es', ...
 
-    if (ctype.includes('application/json')) {
-      const body = await req.json().catch(() => ({}));
-      const code = (body.code || '').toString().toUpperCase();
-      if (!code) return NextResponse.json({ ok: false, error: 'MISSING_CODE' }, { status: 400 });
-      // No audio → nothing to forward; you might force a flush to listeners here if you want
+    const ct = req.headers.get('content-type') || '';
+    const isWav = ct.startsWith('audio/wav');
+
+    // Allow empty JSON pings (flush ticks) without audio
+    if (!isWav) {
+      const maybeJson = await req.text().catch(()=> '');
+      if (!maybeJson) {
+        return NextResponse.json({ ok: false, error: 'UNSUPPORTED_CONTENT_TYPE' }, { status: 400 });
+      }
+      // No-op flush; you can handle if needed
       return NextResponse.json({ ok: true });
     }
 
-    if (!ctype.includes('multipart/form-data')) {
-      return NextResponse.json({ ok: false, error: 'UNSUPPORTED_CONTENT_TYPE' }, { status: 415 });
+    if (!code) {
+      return NextResponse.json({ ok: false, error: 'MISSING_CODE' }, { status: 400 });
     }
 
-    const form = await req.formData();
-    const file = form.get('audio');
-    const code = (form.get('code') || '').toString().toUpperCase();
-    const lang = (form.get('lang') || '').toString();
+    const wavBuffer = Buffer.from(await req.arrayBuffer());
 
-    if (!code || !file) {
-      return NextResponse.json({ ok: false, error: 'MISSING_CODE_OR_AUDIO' }, { status: 400 });
-    }
+    const params = new URLSearchParams({
+      model: 'nova-2',
+      smart_format: 'true',
+    });
+    // Deepgram language handling:
+    // If 'auto', omit language; otherwise add language=<iso>
+    if (lang && lang !== 'auto') params.set('language', lang);
 
-    // Convert Blob to Node Buffer
-    const arrayBuf = await file.arrayBuffer();
-    const buf = Buffer.from(arrayBuf);
-    const contentType = file.type || 'audio/wav';
-
-    // Forward to Deepgram REST
-    const url = `${DG_BASE}?model=${encodeURIComponent(DG_MODEL)}&smart_format=true&punctuate=true${langQuery(lang)}`;
-    const dg = await fetch(url, {
+    const dgRes = await fetch(`https://api.deepgram.com/v1/listen?${params.toString()}`, {
       method: 'POST',
       headers: {
-        'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
-        'Content-Type': contentType,       // 'audio/wav'
-        'Accept': 'application/json',
+        Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`,
+        'Content-Type': 'audio/wav',
       },
-      body: buf,
+      body: wavBuffer,
     });
 
-    if (!dg.ok) {
-      const txt = await dg.text().catch(() => '');
+    if (!dgRes.ok) {
+      const text = await dgRes.text().catch(()=> '');
       return NextResponse.json(
-        { ok: false, error: `Deepgram error ${dg.status}: ${txt}` },
+        { ok: false, error: `Deepgram error ${dgRes.status}: ${text}` },
         { status: 502 }
       );
     }
 
-    const data = await dg.json().catch(() => null);
-    // Pull transcript text (DG standard fields)
-    const text =
-      data?.results?.channels?.[0]?.alternatives?.[0]?.transcript ||
-      data?.results?.alternatives?.[0]?.transcript ||
-      '';
-
-    if (text) {
-      // store for listeners (your existing fan-out via /api/stream)
-      await appendLog(code, text);
-      await kv.set(`onevoice:latest:${code}`, { text, t: Date.now(), lang: lang || 'auto' });
+    const json = await dgRes.json();
+    // Extract best transcript (Deepgram JSON shape)
+    const alt = json?.results?.channels?.[0]?.alternatives?.[0];
+    const transcript = (alt?.transcript || '').trim();
+    if (transcript) {
+      await appendLog(code, transcript);
+      await kv.set(`onevoice:latest:${code}`, { text: transcript, lang, t: Date.now() });
     }
 
-    return NextResponse.json({ ok: true, text });
+    return NextResponse.json({ ok: true, text: transcript || '' });
   } catch (err) {
-    console.error(err);
-    return NextResponse.json({ ok: false, error: String(err?.message || err) }, { status: 500 });
+    console.error('INGEST ERROR', err);
+    return NextResponse.json({ ok: false, error: 'INGEST_EXCEPTION' }, { status: 500 });
   }
 }
